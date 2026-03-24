@@ -1,26 +1,36 @@
 const { Client, GatewayIntentBits, ActionRowBuilder, StringSelectMenuBuilder, ButtonBuilder, ButtonStyle } = require('discord.js');
-const fs = require('fs');
 require('dotenv').config();
+const { MongoClient } = require('mongodb');
 
+// ======================
+// 📦 MONGODB CONNECTION
+// ======================
+const mongoClient = new MongoClient(process.env.MONGO_URI); // corrigido
+let memoryCollection;
+
+async function connectDB() {
+  await mongoClient.connect();
+  console.log("✅ Conectado ao MongoDB!");
+  const db = mongoClient.db("puzzleBotDB");
+  memoryCollection = db.collection("serversMemory");
+
+  const saved = await memoryCollection.findOne({ key: 'servers' });
+  if (saved) {
+    Object.assign(servers, saved.data);
+  }
+}
+
+// ======================
+// 📦 DISCORD CLIENT
+// ======================
 const client = new Client({
   intents: [GatewayIntentBits.Guilds]
 });
 
 // ======================
-// 📦 DATA FILE
+// 📦 IN-MEMORY DATA
 // ======================
-const DATA_FILE = './data.json';
-
-function loadData() {
-  if (!fs.existsSync(DATA_FILE)) return {};
-  return JSON.parse(fs.readFileSync(DATA_FILE));
-}
-
-function saveData() {
-  fs.writeFileSync(DATA_FILE, JSON.stringify(servers, null, 2));
-}
-
-const servers = loadData();
+const servers = {};
 
 // ======================
 // 📚 ALBUMS
@@ -60,6 +70,18 @@ const albumsData = {
     ATyrantCrowned: 11
   }
 };
+
+// ======================
+// 💾 DATABASE FUNCTIONS
+// ======================
+async function saveData() {
+  if (!memoryCollection) return;
+  await memoryCollection.updateOne(
+    { key: 'servers' },
+    { $set: { data: servers } },
+    { upsert: true }
+  );
+}
 
 // ======================
 function ensureServer(guildId) {
@@ -122,7 +144,7 @@ function submitButton(customId = 'submit') {
 // ======================
 // SAVE & REMOVE PIECES
 // ======================
-function savePieces(guildId, userId, type, album, puzzle, pieces) {
+async function savePieces(guildId, userId, type, album, puzzle, pieces) {
   const users = servers[guildId].users;
   const now = Date.now();
 
@@ -134,29 +156,27 @@ function savePieces(guildId, userId, type, album, puzzle, pieces) {
     timestamp: now
   }));
 
-  // Atualiza timestamp da lista inteira
   users[userId][`${type}Updated`] = now;
 
-  saveData();
+  await saveData();
 }
 
-function removePieces(guildId, userId, type, album, puzzle, pieces) {
+async function removePieces(guildId, userId, type, album, puzzle, pieces) {
   const users = servers[guildId].users;
   if (!users[userId] || !users[userId][type]?.[album]?.[puzzle]) return;
 
   users[userId][type][album][puzzle] =
     users[userId][type][album][puzzle].filter(p => !pieces.includes(p.piece));
 
-  // Remove puzzle key se ficar vazio
   if (users[userId][type][album][puzzle].length === 0) {
     delete users[userId][type][album][puzzle];
   }
 
-  saveData();
+  await saveData();
 }
 
 // ======================
-// MATCH
+// MATCH FUNCTION
 // ======================
 function checkMatch(guildId, userId, type, album, puzzle, channel) {
   const opposite = type === 'have' ? 'need' : 'have';
@@ -168,7 +188,6 @@ function checkMatch(guildId, userId, type, album, puzzle, channel) {
     if (otherId === userId) continue;
 
     const otherPieces = (data?.[opposite]?.[album]?.[puzzle] || []).map(p => p.piece);
-
     const matches = myPieces.filter(p => otherPieces.includes(p));
 
     if (matches.length > 0) {
@@ -180,9 +199,9 @@ function checkMatch(guildId, userId, type, album, puzzle, channel) {
 }
 
 // ======================
-// CLEAN OLD DATA (14 dias por lista)
+// CLEAN OLD DATA
 // ======================
-function cleanOldData() {
+async function cleanOldData() {
   const now = Date.now();
   const timeout = 14 * 24 * 60 * 60 * 1000; // 14 dias
 
@@ -197,7 +216,7 @@ function cleanOldData() {
     }
   }
 
-  saveData();
+  await saveData();
 }
 
 // ======================
@@ -218,7 +237,6 @@ client.on('interactionCreate', async interaction => {
   // CHAT COMMANDS
   // ======================
   if (interaction.isChatInputCommand()) {
-
     if (interaction.commandName === 'have' || interaction.commandName === 'need' || interaction.commandName === 'remove') {
       session.type = interaction.commandName === 'remove' ? 'remove' : interaction.commandName;
       session.album = null;
@@ -233,7 +251,6 @@ client.on('interactionCreate', async interaction => {
 
     if (interaction.commandName === 'list') {
       const userData = servers[interaction.guildId]?.users[interaction.user.id];
-
       if (!userData) return interaction.reply({ content: 'You have no data.', ephemeral: true });
 
       let msg = '';
@@ -289,7 +306,7 @@ client.on('interactionCreate', async interaction => {
         user.need = {};
       }
 
-      saveData();
+      await saveData();
       return interaction.update({ content: `✅ Cleared ${choice}`, components: [] });
     }
 
@@ -313,20 +330,17 @@ client.on('interactionCreate', async interaction => {
       const pieces = interaction.values;
 
       if (session.type === 'remove') {
-        removePieces(interaction.guildId, interaction.user.id, 'have', album, puzzle, pieces);
-        removePieces(interaction.guildId, interaction.user.id, 'need', album, puzzle, pieces);
+        await removePieces(interaction.guildId, interaction.user.id, 'have', album, puzzle, pieces);
+        await removePieces(interaction.guildId, interaction.user.id, 'need', album, puzzle, pieces);
 
         return interaction.update({ content: `Removed pieces from ${puzzle}`, components: [submitButton()] });
       } else {
-        // SAVE pieces
-        savePieces(interaction.guildId, interaction.user.id, session.type, album, puzzle, pieces);
+        await savePieces(interaction.guildId, interaction.user.id, session.type, album, puzzle, pieces);
 
-        // Send update for everyone
         interaction.channel.send(
           `📦 <@${interaction.user.id}> updated their ${session.type} list for ${puzzle}: ${pieces.join(', ')}`
         );
 
-        // Check for matches
         checkMatch(interaction.guildId, interaction.user.id, session.type, album, puzzle, interaction.channel);
 
         return interaction.update({ content: `✅ Updated ${puzzle}`, components: [submitButton()] });
@@ -347,6 +361,8 @@ client.on('interactionCreate', async interaction => {
 
 // ======================
 client.once('ready', async () => {
+  await connectDB(); // conexão com MongoDB
+
   await client.application.commands.set([
     { name: 'have', description: 'Pieces you have' },
     { name: 'need', description: 'Pieces you need' },
