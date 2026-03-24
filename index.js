@@ -5,7 +5,7 @@ const { MongoClient } = require('mongodb');
 // ======================
 // 📦 MONGODB CONNECTION
 // ======================
-const mongoClient = new MongoClient(process.env.MONGO_URI); // corrigido
+const mongoClient = new MongoClient(process.env.MONGO_URI); // já sem useUnifiedTopology
 let memoryCollection;
 
 async function connectDB() {
@@ -14,8 +14,12 @@ async function connectDB() {
   const db = mongoClient.db("puzzleBotDB");
   memoryCollection = db.collection("serversMemory");
 
+  // Criar documento inicial se não existir
   const saved = await memoryCollection.findOne({ key: 'servers' });
-  if (saved) {
+  if (!saved) {
+    await memoryCollection.insertOne({ key: 'servers', data: {} });
+    console.log("📂 Documento inicial criado no MongoDB");
+  } else {
     Object.assign(servers, saved.data);
   }
 }
