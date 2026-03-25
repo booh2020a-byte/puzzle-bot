@@ -5,22 +5,29 @@ const { MongoClient } = require('mongodb');
 // ======================
 // 📦 MONGODB CONNECTION
 // ======================
-const mongoClient = new MongoClient(process.env.MONGO_URI); // já sem useUnifiedTopology
+const mongoClient = new MongoClient(process.env.MONGO_URI, {
+  tls: true,
+  tlsAllowInvalidCertificates: true, // fix SSL/TLS error no Railway (Node 18 + OpenSSL 3)
+});
 let memoryCollection;
 
 async function connectDB() {
-  await mongoClient.connect();
-  console.log("✅ Conectado ao MongoDB!");
-  const db = mongoClient.db("puzzleBotDB");
-  memoryCollection = db.collection("serversMemory");
+  try {
+    await mongoClient.connect();
+    console.log("✅ Conectado ao MongoDB!");
+    const db = mongoClient.db("puzzleBotDB");
+    memoryCollection = db.collection("serversMemory");
 
-  // Criar documento inicial se não existir
-  const saved = await memoryCollection.findOne({ key: 'servers' });
-  if (!saved) {
-    await memoryCollection.insertOne({ key: 'servers', data: {} });
-    console.log("📂 Documento inicial criado no MongoDB");
-  } else {
-    Object.assign(servers, saved.data);
+    const saved = await memoryCollection.findOne({ key: 'servers' });
+    if (!saved) {
+      await memoryCollection.insertOne({ key: 'servers', data: {} });
+      console.log("📂 Documento inicial criado no MongoDB");
+    } else {
+      Object.assign(servers, saved.data);
+    }
+  } catch (err) {
+    console.error("❌ Erro ao conectar ao MongoDB:", err);
+    process.exit(1); // Railway vai reiniciar automaticamente
   }
 }
 
@@ -182,7 +189,7 @@ async function removePieces(guildId, userId, type, album, puzzle, pieces) {
 // ======================
 // MATCH FUNCTION
 // ======================
-function checkMatch(guildId, userId, type, album, puzzle, channel) {
+async function checkMatch(guildId, userId, type, album, puzzle, channel) {
   const opposite = type === 'have' ? 'need' : 'have';
   const users = servers[guildId].users;
 
@@ -194,8 +201,8 @@ function checkMatch(guildId, userId, type, album, puzzle, channel) {
     const otherPieces = (data?.[opposite]?.[album]?.[puzzle] || []).map(p => p.piece);
     const matches = myPieces.filter(p => otherPieces.includes(p));
 
-    if (matches.length > 0) {
-      channel.send(
+    if (matches.length > 0 && channel) {
+      await channel.send(
         `🔥 MATCH!\n<@${userId}> (${type}) ↔ <@${otherId}> (${opposite})\nAlbum: ${album}\nPuzzle: ${puzzle}\nPieces: ${matches.join(', ')}`
       );
     }
@@ -229,144 +236,160 @@ async function cleanOldData() {
 client.on('interactionCreate', async interaction => {
   if (!interaction.guildId) return;
 
-  ensureServer(interaction.guildId);
+  try {
+    ensureServer(interaction.guildId);
 
-  if (!servers[interaction.guildId].sessions[interaction.user.id]) {
-    servers[interaction.guildId].sessions[interaction.user.id] = {};
-  }
-
-  const session = servers[interaction.guildId].sessions[interaction.user.id];
-
-  // ======================
-  // CHAT COMMANDS
-  // ======================
-  if (interaction.isChatInputCommand()) {
-    if (interaction.commandName === 'have' || interaction.commandName === 'need' || interaction.commandName === 'remove') {
-      session.type = interaction.commandName === 'remove' ? 'remove' : interaction.commandName;
-      session.album = null;
-      session.puzzle = null;
-
-      return interaction.reply({
-        content: 'Select album:',
-        components: [albumMenu()],
-        ephemeral: true
-      });
+    if (!servers[interaction.guildId].sessions[interaction.user.id]) {
+      servers[interaction.guildId].sessions[interaction.user.id] = {};
     }
 
-    if (interaction.commandName === 'list') {
-      const userData = servers[interaction.guildId]?.users[interaction.user.id];
-      if (!userData) return interaction.reply({ content: 'You have no data.', ephemeral: true });
+    const session = servers[interaction.guildId].sessions[interaction.user.id];
 
-      let msg = '';
-      ['have', 'need'].forEach(type => {
-        msg += `\n**${type.toUpperCase()}**\n`;
-        for (const album in userData[type] || {}) {
-          for (const puzzle in userData[type][album]) {
-            const pieces = userData[type][album][puzzle].map(p => p.piece);
-            msg += `${album} → ${puzzle}: ${pieces.join(', ')}\n`;
+    // ======================
+    // CHAT COMMANDS
+    // ======================
+    if (interaction.isChatInputCommand()) {
+      if (interaction.commandName === 'have' || interaction.commandName === 'need' || interaction.commandName === 'remove') {
+        session.type = interaction.commandName === 'remove' ? 'remove' : interaction.commandName;
+        session.album = null;
+        session.puzzle = null;
+
+        return interaction.reply({
+          content: 'Select album:',
+          components: [albumMenu()],
+          ephemeral: true
+        });
+      }
+
+      if (interaction.commandName === 'list') {
+        const userData = servers[interaction.guildId]?.users[interaction.user.id];
+        if (!userData) return interaction.reply({ content: 'You have no data.', ephemeral: true });
+
+        let msg = '';
+        ['have', 'need'].forEach(type => {
+          msg += `\n**${type.toUpperCase()}**\n`;
+          for (const album in userData[type] || {}) {
+            for (const puzzle in userData[type][album]) {
+              const pieces = userData[type][album][puzzle].map(p => p.piece);
+              msg += `${album} → ${puzzle}: ${pieces.join(', ')}\n`;
+            }
           }
+        });
+
+        return interaction.reply({ content: msg || 'No data.', ephemeral: true });
+      }
+
+      if (interaction.commandName === 'clear') {
+        return interaction.reply({
+          content: 'Which list do you want to clear?',
+          components: [
+            new ActionRowBuilder().addComponents(
+              new StringSelectMenuBuilder()
+                .setCustomId('clearMenu')
+                .setPlaceholder('Select list to clear')
+                .addOptions([
+                  { label: 'Have', value: 'have' },
+                  { label: 'Need', value: 'need' },
+                  { label: 'Both', value: 'both' }
+                ])
+            )
+          ],
+          ephemeral: true
+        });
+      }
+    }
+
+    // ======================
+    // MENUS
+    // ======================
+    if (interaction.isStringSelectMenu()) {
+      const parts = interaction.customId.split('|');
+
+      // CLEAR MENU
+      if (interaction.customId === 'clearMenu') {
+        const choice = interaction.values[0];
+        const user = servers[interaction.guildId].users[interaction.user.id];
+        if (!user) return interaction.update({ content: 'No data to clear.', components: [] });
+
+        if (choice === 'have' || choice === 'need') {
+          user[choice] = {};
+        } else if (choice === 'both') {
+          user.have = {};
+          user.need = {};
         }
-      });
 
-      interaction.reply({ content: msg || 'No data.', ephemeral: true });
-    }
-
-    if (interaction.commandName === 'clear') {
-      return interaction.reply({
-        content: 'Which list do you want to clear?',
-        components: [
-          new ActionRowBuilder().addComponents(
-            new StringSelectMenuBuilder()
-              .setCustomId('clearMenu')
-              .setPlaceholder('Select list to clear')
-              .addOptions([
-                { label: 'Have', value: 'have' },
-                { label: 'Need', value: 'need' },
-                { label: 'Both', value: 'both' }
-              ])
-          )
-        ],
-        ephemeral: true
-      });
-    }
-  }
-
-  // ======================
-  // MENUS
-  // ======================
-  if (interaction.isStringSelectMenu()) {
-    const parts = interaction.customId.split('|');
-
-    // CLEAR MENU
-    if (interaction.customId === 'clearMenu') {
-      const choice = interaction.values[0];
-      const user = servers[interaction.guildId].users[interaction.user.id];
-      if (!user) return interaction.update({ content: 'No data to clear.', components: [] });
-
-      if (choice === 'have' || choice === 'need') {
-        user[choice] = {};
-      } else if (choice === 'both') {
-        user.have = {};
-        user.need = {};
+        await saveData();
+        return interaction.update({ content: `✅ Cleared ${choice}`, components: [] });
       }
 
-      await saveData();
-      return interaction.update({ content: `✅ Cleared ${choice}`, components: [] });
-    }
+      // ALBUM MENU
+      if (interaction.customId === 'album') {
+        session.album = interaction.values[0];
+        return interaction.update({ content: `Album: ${session.album}`, components: [puzzleMenu(session.album)] });
+      }
 
-    // ALBUM MENU
-    if (interaction.customId === 'album') {
-      session.album = interaction.values[0];
-      return interaction.update({ content: `Album: ${session.album}`, components: [puzzleMenu(session.album)] });
-    }
+      // PUZZLE MENU
+      if (parts[0] === 'puzzle') {
+        session.album = parts[1]; // garante que o album fica salvo na sessão
+        session.puzzle = interaction.values[0];
+        return interaction.update({ content: `Puzzle: ${session.puzzle}`, components: [piecesMenu(parts[1], session.puzzle)] });
+      }
 
-    // PUZZLE MENU
-    if (parts[0] === 'puzzle') {
-      const album = parts[1];
-      session.puzzle = interaction.values[0];
-      return interaction.update({ content: `Puzzle: ${session.puzzle}`, components: [piecesMenu(album, session.puzzle)] });
-    }
+      // PIECES MENU
+      if (parts[0] === 'pieces') {
+        const album = parts[1];
+        const puzzle = parts[2];
+        const pieces = interaction.values;
 
-    // PIECES MENU
-    if (parts[0] === 'pieces') {
-      const album = parts[1];
-      const puzzle = parts[2];
-      const pieces = interaction.values;
+        if (session.type === 'remove') {
+          await removePieces(interaction.guildId, interaction.user.id, 'have', album, puzzle, pieces);
+          await removePieces(interaction.guildId, interaction.user.id, 'need', album, puzzle, pieces);
 
-      if (session.type === 'remove') {
-        await removePieces(interaction.guildId, interaction.user.id, 'have', album, puzzle, pieces);
-        await removePieces(interaction.guildId, interaction.user.id, 'need', album, puzzle, pieces);
+          return interaction.update({ content: `✅ Removed pieces from ${puzzle}`, components: [submitButton()] });
+        } else {
+          await savePieces(interaction.guildId, interaction.user.id, session.type, album, puzzle, pieces);
 
-        return interaction.update({ content: `Removed pieces from ${puzzle}`, components: [submitButton()] });
-      } else {
-        await savePieces(interaction.guildId, interaction.user.id, session.type, album, puzzle, pieces);
+          if (interaction.channel) {
+            await interaction.channel.send(
+              `📦 <@${interaction.user.id}> updated their ${session.type} list for ${puzzle}: ${pieces.join(', ')}`
+            );
+          }
 
-        interaction.channel.send(
-          `📦 <@${interaction.user.id}> updated their ${session.type} list for ${puzzle}: ${pieces.join(', ')}`
-        );
+          await checkMatch(interaction.guildId, interaction.user.id, session.type, album, puzzle, interaction.channel);
 
-        checkMatch(interaction.guildId, interaction.user.id, session.type, album, puzzle, interaction.channel);
-
-        return interaction.update({ content: `✅ Updated ${puzzle}`, components: [submitButton()] });
+          return interaction.update({ content: `✅ Updated ${puzzle}`, components: [submitButton()] });
+        }
       }
     }
-  }
 
-  // ======================
-  // BUTTONS
-  // ======================
-  if (interaction.isButton()) {
-    if (interaction.customId === 'submit') {
-      delete servers[interaction.guildId].sessions[interaction.user.id];
-      return interaction.update({ content: '✅ Done!', components: [] });
+    // ======================
+    // BUTTONS
+    // ======================
+    if (interaction.isButton()) {
+      if (interaction.customId === 'submit') {
+        delete servers[interaction.guildId].sessions[interaction.user.id];
+        return interaction.update({ content: '✅ Done!', components: [] });
+      }
     }
+
+  } catch (err) {
+    console.error("❌ Erro na interação:", err);
+    try {
+      if (interaction.replied || interaction.deferred) return;
+      await interaction.reply({ content: '❌ Algo deu errado. Tente novamente.', ephemeral: true });
+    } catch (_) {}
   }
 });
 
 // ======================
-client.once('ready', async () => {
-  await connectDB(); // conexão com MongoDB
+// START
+// ======================
+async function start() {
+  await connectDB();
+  await client.login(process.env.TOKEN);
+}
 
+client.once('clientReady', async () => {
   await client.application.commands.set([
     { name: 'have', description: 'Pieces you have' },
     { name: 'need', description: 'Pieces you need' },
@@ -379,4 +402,4 @@ client.once('ready', async () => {
   console.log(`✅ Logged in as ${client.user.tag}`);
 });
 
-client.login(process.env.TOKEN);
+start();
