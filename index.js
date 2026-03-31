@@ -27,7 +27,7 @@ async function connectDB() {
     }
   } catch (err) {
     console.error("❌ Erro ao conectar ao MongoDB:", err);
-    process.exit(1); // Railway vai reiniciar automaticamente
+    process.exit(1);
   }
 }
 
@@ -94,14 +94,12 @@ async function saveData() {
   );
 }
 
-// ======================
 function ensureServer(guildId) {
   if (!servers[guildId]) {
     servers[guildId] = { users: {}, sessions: {} };
   }
 }
 
-// ======================
 function makePieces(n) {
   return Array.from({ length: n }, (_, i) => (i + 1).toString());
 }
@@ -297,6 +295,62 @@ client.on('interactionCreate', async interaction => {
           ephemeral: true
         });
       }
+
+      // ======================
+      // /matches COMMAND
+      // ======================
+      if (interaction.commandName === 'matches') {
+        const users = servers[interaction.guildId]?.users;
+        const userId = interaction.user.id;
+        const myData = users?.[userId];
+
+        if (!myData) return interaction.reply({ content: 'You have no data.', ephemeral: true });
+
+        const matchMap = {};
+
+        for (const [otherId, otherData] of Object.entries(users)) {
+          if (otherId === userId) continue;
+
+          // My HAVE vs their NEED
+          for (const album in myData.have || {}) {
+            for (const puzzle in myData.have[album]) {
+              const myPieces = myData.have[album][puzzle].map(p => p.piece);
+              const theirPieces = (otherData.need?.[album]?.[puzzle] || []).map(p => p.piece);
+              const matches = myPieces.filter(p => theirPieces.includes(p));
+              if (matches.length > 0) {
+                const key = `${album} → ${puzzle}`;
+                if (!matchMap[key]) matchMap[key] = [];
+                matchMap[key].push(`I **have** piece(s) **${matches.join(', ')}** that <@${otherId}> needs`);
+              }
+            }
+          }
+
+          // My NEED vs their HAVE
+          for (const album in myData.need || {}) {
+            for (const puzzle in myData.need[album]) {
+              const myPieces = myData.need[album][puzzle].map(p => p.piece);
+              const theirPieces = (otherData.have?.[album]?.[puzzle] || []).map(p => p.piece);
+              const matches = myPieces.filter(p => theirPieces.includes(p));
+              if (matches.length > 0) {
+                const key = `${album} → ${puzzle}`;
+                if (!matchMap[key]) matchMap[key] = [];
+                matchMap[key].push(`I **need** piece(s) **${matches.join(', ')}** that <@${otherId}> has`);
+              }
+            }
+          }
+        }
+
+        if (Object.keys(matchMap).length === 0) {
+          return interaction.reply({ content: 'No current matches found.', ephemeral: true });
+        }
+
+        let msg = '🔥 **Your current matches:**\n\n';
+        for (const [key, lines] of Object.entries(matchMap)) {
+          msg += `**${key}**\n${lines.join('\n')}\n\n`;
+        }
+
+        return interaction.reply({ content: msg, ephemeral: true });
+      }
     }
 
     // ======================
@@ -330,7 +384,7 @@ client.on('interactionCreate', async interaction => {
 
       // PUZZLE MENU
       if (parts[0] === 'puzzle') {
-        session.album = parts[1]; // garante que o album fica salvo na sessão
+        session.album = parts[1];
         session.puzzle = interaction.values[0];
         return interaction.update({ content: `Puzzle: ${session.puzzle}`, components: [piecesMenu(parts[1], session.puzzle)] });
       }
@@ -395,7 +449,8 @@ client.once('clientReady', async () => {
     { name: 'need', description: 'Pieces you need' },
     { name: 'remove', description: 'Remove pieces from your lists' },
     { name: 'list', description: 'See your pieces' },
-    { name: 'clear', description: 'Clear your data' }
+    { name: 'clear', description: 'Clear your data' },
+    { name: 'matches', description: 'See your current matches' }
   ]);
 
   setInterval(cleanOldData, 60 * 60 * 1000);
