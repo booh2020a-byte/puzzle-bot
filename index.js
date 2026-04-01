@@ -7,7 +7,7 @@ const { MongoClient } = require('mongodb');
 // ======================
 const mongoClient = new MongoClient(process.env.MONGO_URI, {
   tls: true,
-  tlsAllowInvalidCertificates: true, // fix SSL/TLS error no Railway (Node 18 + OpenSSL 3)
+  tlsAllowInvalidCertificates: true,
 });
 let memoryCollection;
 
@@ -105,6 +105,58 @@ function makePieces(n) {
 }
 
 // ======================
+// HELPERS
+// ======================
+
+// Formats a have/need list grouped by album
+function formatList(typeData) {
+  if (!typeData || Object.keys(typeData).length === 0) return null;
+
+  let msg = '';
+  for (const album in typeData) {
+    const puzzles = typeData[album];
+    if (Object.keys(puzzles).length === 0) continue;
+    msg += `**${album}:**\n`;
+    for (const puzzle in puzzles) {
+      const pieces = puzzles[puzzle].map(p => p.piece);
+      if (pieces.length > 0) msg += `${puzzle}: ${pieces.join(', ')}\n`;
+    }
+    msg += '\n';
+  }
+  return msg.trim() || null;
+}
+
+// Sends a message in chunks under Discord's 2000 char limit
+async function sendChunked(interaction, header, body, alreadyReplied = false) {
+  const chunks = [];
+  let current = header ? header + '\n\n' : '';
+
+  const lines = body.split('\n');
+  for (const line of lines) {
+    if (current.length + line.length + 1 > 1900) {
+      chunks.push(current);
+      current = '';
+    }
+    current += line + '\n';
+  }
+  if (current.trim()) chunks.push(current);
+
+  if (chunks.length === 0) {
+    if (!alreadyReplied) await interaction.reply({ content: 'No data found.', ephemeral: true });
+    return;
+  }
+
+  if (!alreadyReplied) {
+    await interaction.reply({ content: chunks[0], ephemeral: true });
+  } else {
+    await interaction.followUp({ content: chunks[0], ephemeral: true });
+  }
+  for (let i = 1; i < chunks.length; i++) {
+    await interaction.followUp({ content: chunks[i], ephemeral: true });
+  }
+}
+
+// ======================
 // MENUS
 // ======================
 function albumMenu() {
@@ -128,9 +180,7 @@ function puzzleMenu(album) {
 function piecesMenu(album, puzzle) {
   const count = albumsData[album]?.[puzzle];
   if (!count) return null;
-
   const pieces = makePieces(count);
-
   return new ActionRowBuilder().addComponents(
     new StringSelectMenuBuilder()
       .setCustomId(`pieces|${album}|${puzzle}`)
@@ -150,6 +200,30 @@ function submitButton(customId = 'submit') {
   );
 }
 
+function listTypeMenu() {
+  return new ActionRowBuilder().addComponents(
+    new StringSelectMenuBuilder()
+      .setCustomId('listType')
+      .setPlaceholder('Select list to view')
+      .addOptions([
+        { label: 'Have', value: 'have' },
+        { label: 'Need', value: 'need' }
+      ])
+  );
+}
+
+function matchesTypeMenu() {
+  return new ActionRowBuilder().addComponents(
+    new StringSelectMenuBuilder()
+      .setCustomId('matchesType')
+      .setPlaceholder('Select match direction')
+      .addOptions([
+        { label: 'Pieces I have that others need', value: 'have' },
+        { label: 'Pieces I need that others have', value: 'need' }
+      ])
+  );
+}
+
 // ======================
 // SAVE & REMOVE PIECES
 // ======================
@@ -166,7 +240,6 @@ async function savePieces(guildId, userId, type, album, puzzle, pieces) {
   }));
 
   users[userId][`${type}Updated`] = now;
-
   await saveData();
 }
 
@@ -190,15 +263,12 @@ async function removePieces(guildId, userId, type, album, puzzle, pieces) {
 async function checkMatch(guildId, userId, type, album, puzzle, channel) {
   const opposite = type === 'have' ? 'need' : 'have';
   const users = servers[guildId].users;
-
   const myPieces = (users[userId]?.[type]?.[album]?.[puzzle] || []).map(p => p.piece);
 
   for (const [otherId, data] of Object.entries(users)) {
     if (otherId === userId) continue;
-
     const otherPieces = (data?.[opposite]?.[album]?.[puzzle] || []).map(p => p.piece);
     const matches = myPieces.filter(p => otherPieces.includes(p));
-
     if (matches.length > 0 && channel) {
       await channel.send(
         `🔥 MATCH!\n<@${userId}> (${type}) ↔ <@${otherId}> (${opposite})\nAlbum: ${album}\nPuzzle: ${puzzle}\nPieces: ${matches.join(', ')}`
@@ -212,7 +282,7 @@ async function checkMatch(guildId, userId, type, album, puzzle, channel) {
 // ======================
 async function cleanOldData() {
   const now = Date.now();
-  const timeout = 14 * 24 * 60 * 60 * 1000; // 14 dias
+  const timeout = 14 * 24 * 60 * 60 * 1000;
 
   for (const guild of Object.values(servers)) {
     for (const [userId, user] of Object.entries(guild.users || {})) {
@@ -247,34 +317,30 @@ client.on('interactionCreate', async interaction => {
     // CHAT COMMANDS
     // ======================
     if (interaction.isChatInputCommand()) {
+
       if (interaction.commandName === 'have' || interaction.commandName === 'need' || interaction.commandName === 'remove') {
         session.type = interaction.commandName === 'remove' ? 'remove' : interaction.commandName;
         session.album = null;
         session.puzzle = null;
+        return interaction.reply({ content: 'Select album:', components: [albumMenu()], ephemeral: true });
+      }
 
+      // /list → ask have or need
+      if (interaction.commandName === 'list') {
         return interaction.reply({
-          content: 'Select album:',
-          components: [albumMenu()],
+          content: 'Which list do you want to see?',
+          components: [listTypeMenu()],
           ephemeral: true
         });
       }
 
-      if (interaction.commandName === 'list') {
-        const userData = servers[interaction.guildId]?.users[interaction.user.id];
-        if (!userData) return interaction.reply({ content: 'You have no data.', ephemeral: true });
-
-        let msg = '';
-        ['have', 'need'].forEach(type => {
-          msg += `\n**${type.toUpperCase()}**\n`;
-          for (const album in userData[type] || {}) {
-            for (const puzzle in userData[type][album]) {
-              const pieces = userData[type][album][puzzle].map(p => p.piece);
-              msg += `${album} → ${puzzle}: ${pieces.join(', ')}\n`;
-            }
-          }
+      // /matches → ask direction
+      if (interaction.commandName === 'matches') {
+        return interaction.reply({
+          content: 'Which matches do you want to see?',
+          components: [matchesTypeMenu()],
+          ephemeral: true
         });
-
-        return interaction.reply({ content: msg || 'No data.', ephemeral: true });
       }
 
       if (interaction.commandName === 'clear') {
@@ -295,62 +361,6 @@ client.on('interactionCreate', async interaction => {
           ephemeral: true
         });
       }
-
-      // ======================
-      // /matches COMMAND
-      // ======================
-      if (interaction.commandName === 'matches') {
-        const users = servers[interaction.guildId]?.users;
-        const userId = interaction.user.id;
-        const myData = users?.[userId];
-
-        if (!myData) return interaction.reply({ content: 'You have no data.', ephemeral: true });
-
-        const matchMap = {};
-
-        for (const [otherId, otherData] of Object.entries(users)) {
-          if (otherId === userId) continue;
-
-          // My HAVE vs their NEED
-          for (const album in myData.have || {}) {
-            for (const puzzle in myData.have[album]) {
-              const myPieces = myData.have[album][puzzle].map(p => p.piece);
-              const theirPieces = (otherData.need?.[album]?.[puzzle] || []).map(p => p.piece);
-              const matches = myPieces.filter(p => theirPieces.includes(p));
-              if (matches.length > 0) {
-                const key = `${album} → ${puzzle}`;
-                if (!matchMap[key]) matchMap[key] = [];
-                matchMap[key].push(`I **have** piece(s) **${matches.join(', ')}** that <@${otherId}> needs`);
-              }
-            }
-          }
-
-          // My NEED vs their HAVE
-          for (const album in myData.need || {}) {
-            for (const puzzle in myData.need[album]) {
-              const myPieces = myData.need[album][puzzle].map(p => p.piece);
-              const theirPieces = (otherData.have?.[album]?.[puzzle] || []).map(p => p.piece);
-              const matches = myPieces.filter(p => theirPieces.includes(p));
-              if (matches.length > 0) {
-                const key = `${album} → ${puzzle}`;
-                if (!matchMap[key]) matchMap[key] = [];
-                matchMap[key].push(`I **need** piece(s) **${matches.join(', ')}** that <@${otherId}> has`);
-              }
-            }
-          }
-        }
-
-        if (Object.keys(matchMap).length === 0) {
-          return interaction.reply({ content: 'No current matches found.', ephemeral: true });
-        }
-
-        let msg = '🔥 **Your current matches:**\n\n';
-        for (const [key, lines] of Object.entries(matchMap)) {
-          msg += `**${key}**\n${lines.join('\n')}\n\n`;
-        }
-
-        return interaction.reply({ content: msg, ephemeral: true });
-      }
     }
 
     // ======================
@@ -358,6 +368,105 @@ client.on('interactionCreate', async interaction => {
     // ======================
     if (interaction.isStringSelectMenu()) {
       const parts = interaction.customId.split('|');
+
+      // LIST TYPE MENU
+      if (interaction.customId === 'listType') {
+        const type = interaction.values[0];
+        const userData = servers[interaction.guildId]?.users[interaction.user.id];
+        const typeData = userData?.[type];
+        const formatted = formatList(typeData);
+
+        if (!formatted) {
+          return interaction.update({ content: `Your **${type}** list is empty.`, components: [] });
+        }
+
+        await interaction.update({ content: `📋 **Your ${type.toUpperCase()} list:**\n\n${formatted.slice(0, 1900)}`, components: [] });
+
+        // Send remaining chunks if needed
+        if (formatted.length > 1900) {
+          const remaining = formatted.slice(1900);
+          const chunks = [];
+          let current = '';
+          for (const line of remaining.split('\n')) {
+            if (current.length + line.length + 1 > 1900) { chunks.push(current); current = ''; }
+            current += line + '\n';
+          }
+          if (current.trim()) chunks.push(current);
+          for (const chunk of chunks) {
+            await interaction.followUp({ content: chunk, ephemeral: true });
+          }
+        }
+        return;
+      }
+
+      // MATCHES TYPE MENU
+      if (interaction.customId === 'matchesType') {
+        const direction = interaction.values[0]; // 'have' or 'need'
+        const opposite = direction === 'have' ? 'need' : 'have';
+        const users = servers[interaction.guildId]?.users;
+        const userId = interaction.user.id;
+        const myData = users?.[userId];
+
+        if (!myData) {
+          return interaction.update({ content: 'You have no data.', components: [] });
+        }
+
+        // Group by album → puzzle
+        const matchMap = {};
+
+        for (const [otherId, otherData] of Object.entries(users)) {
+          if (otherId === userId) continue;
+
+          for (const album in myData[direction] || {}) {
+            for (const puzzle in myData[direction][album]) {
+              const myPieces = myData[direction][album][puzzle].map(p => p.piece);
+              const theirPieces = (otherData[opposite]?.[album]?.[puzzle] || []).map(p => p.piece);
+              const matches = myPieces.filter(p => theirPieces.includes(p));
+              if (matches.length > 0) {
+                if (!matchMap[album]) matchMap[album] = {};
+                if (!matchMap[album][puzzle]) matchMap[album][puzzle] = [];
+                const verb = direction === 'have' ? 'needs' : 'has';
+                matchMap[album][puzzle].push(`${matches.join(', ')} — <@${otherId}> ${verb} ${direction === 'have' ? 'it' : 'it'}`);
+              }
+            }
+          }
+        }
+
+        if (Object.keys(matchMap).length === 0) {
+          return interaction.update({ content: 'No current matches found.', components: [] });
+        }
+
+        // Format grouped by album
+        const label = direction === 'have' ? 'Pieces I HAVE that others need' : 'Pieces I NEED that others have';
+        let body = '';
+        for (const album in matchMap) {
+          body += `**${album}:**\n`;
+          for (const puzzle in matchMap[album]) {
+            for (const line of matchMap[album][puzzle]) {
+              body += `${puzzle}: ${line}\n`;
+            }
+          }
+          body += '\n';
+        }
+
+        const header = `🔥 **${label}:**`;
+        const full = header + '\n\n' + body.trim();
+
+        // Chunk and send
+        const chunks = [];
+        let current = '';
+        for (const line of full.split('\n')) {
+          if (current.length + line.length + 1 > 1900) { chunks.push(current); current = ''; }
+          current += line + '\n';
+        }
+        if (current.trim()) chunks.push(current);
+
+        await interaction.update({ content: chunks[0], components: [] });
+        for (let i = 1; i < chunks.length; i++) {
+          await interaction.followUp({ content: chunks[i], ephemeral: true });
+        }
+        return;
+      }
 
       // CLEAR MENU
       if (interaction.customId === 'clearMenu') {
@@ -398,7 +507,6 @@ client.on('interactionCreate', async interaction => {
         if (session.type === 'remove') {
           await removePieces(interaction.guildId, interaction.user.id, 'have', album, puzzle, pieces);
           await removePieces(interaction.guildId, interaction.user.id, 'need', album, puzzle, pieces);
-
           return interaction.update({ content: `✅ Removed pieces from ${puzzle}`, components: [submitButton()] });
         } else {
           await savePieces(interaction.guildId, interaction.user.id, session.type, album, puzzle, pieces);
@@ -410,7 +518,6 @@ client.on('interactionCreate', async interaction => {
           }
 
           await checkMatch(interaction.guildId, interaction.user.id, session.type, album, puzzle, interaction.channel);
-
           return interaction.update({ content: `✅ Updated ${puzzle}`, components: [submitButton()] });
         }
       }
