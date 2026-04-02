@@ -107,8 +107,6 @@ function makePieces(n) {
 // ======================
 // HELPERS
 // ======================
-
-// Formats a have/need list grouped by album
 function formatList(typeData) {
   if (!typeData || Object.keys(typeData).length === 0) return null;
 
@@ -124,36 +122,6 @@ function formatList(typeData) {
     msg += '\n';
   }
   return msg.trim() || null;
-}
-
-// Sends a message in chunks under Discord's 2000 char limit
-async function sendChunked(interaction, header, body, alreadyReplied = false) {
-  const chunks = [];
-  let current = header ? header + '\n\n' : '';
-
-  const lines = body.split('\n');
-  for (const line of lines) {
-    if (current.length + line.length + 1 > 1900) {
-      chunks.push(current);
-      current = '';
-    }
-    current += line + '\n';
-  }
-  if (current.trim()) chunks.push(current);
-
-  if (chunks.length === 0) {
-    if (!alreadyReplied) await interaction.reply({ content: 'No data found.', ephemeral: true });
-    return;
-  }
-
-  if (!alreadyReplied) {
-    await interaction.reply({ content: chunks[0], ephemeral: true });
-  } else {
-    await interaction.followUp({ content: chunks[0], ephemeral: true });
-  }
-  for (let i = 1; i < chunks.length; i++) {
-    await interaction.followUp({ content: chunks[i], ephemeral: true });
-  }
 }
 
 // ======================
@@ -234,12 +202,15 @@ async function savePieces(guildId, userId, type, album, puzzle, pieces) {
   if (!users[userId]) users[userId] = { have: {}, need: {} };
   if (!users[userId][type][album]) users[userId][type][album] = {};
 
-  users[userId][type][album][puzzle] = pieces.map(p => ({
-    piece: p,
-    timestamp: now
-  }));
+  const existing = users[userId][type][album][puzzle] || [];
 
+  // Keep existing pieces not in the new submission, then merge new ones
+  const existingKept = existing.filter(p => !pieces.includes(p.piece));
+  const newPieces = pieces.map(p => ({ piece: p, timestamp: now }));
+
+  users[userId][type][album][puzzle] = [...existingKept, ...newPieces];
   users[userId][`${type}Updated`] = now;
+
   await saveData();
 }
 
@@ -325,7 +296,6 @@ client.on('interactionCreate', async interaction => {
         return interaction.reply({ content: 'Select album:', components: [albumMenu()], ephemeral: true });
       }
 
-      // /list → ask have or need
       if (interaction.commandName === 'list') {
         return interaction.reply({
           content: 'Which list do you want to see?',
@@ -334,7 +304,6 @@ client.on('interactionCreate', async interaction => {
         });
       }
 
-      // /matches → ask direction
       if (interaction.commandName === 'matches') {
         return interaction.reply({
           content: 'Which matches do you want to see?',
@@ -380,28 +349,24 @@ client.on('interactionCreate', async interaction => {
           return interaction.update({ content: `Your **${type}** list is empty.`, components: [] });
         }
 
-        await interaction.update({ content: `📋 **Your ${type.toUpperCase()} list:**\n\n${formatted.slice(0, 1900)}`, components: [] });
+        const chunks = [];
+        let current = `📋 **Your ${type.toUpperCase()} list:**\n\n`;
+        for (const line of formatted.split('\n')) {
+          if (current.length + line.length + 1 > 1900) { chunks.push(current); current = ''; }
+          current += line + '\n';
+        }
+        if (current.trim()) chunks.push(current);
 
-        // Send remaining chunks if needed
-        if (formatted.length > 1900) {
-          const remaining = formatted.slice(1900);
-          const chunks = [];
-          let current = '';
-          for (const line of remaining.split('\n')) {
-            if (current.length + line.length + 1 > 1900) { chunks.push(current); current = ''; }
-            current += line + '\n';
-          }
-          if (current.trim()) chunks.push(current);
-          for (const chunk of chunks) {
-            await interaction.followUp({ content: chunk, ephemeral: true });
-          }
+        await interaction.update({ content: chunks[0], components: [] });
+        for (let i = 1; i < chunks.length; i++) {
+          await interaction.followUp({ content: chunks[i], ephemeral: true });
         }
         return;
       }
 
       // MATCHES TYPE MENU
       if (interaction.customId === 'matchesType') {
-        const direction = interaction.values[0]; // 'have' or 'need'
+        const direction = interaction.values[0];
         const opposite = direction === 'have' ? 'need' : 'have';
         const users = servers[interaction.guildId]?.users;
         const userId = interaction.user.id;
@@ -411,7 +376,6 @@ client.on('interactionCreate', async interaction => {
           return interaction.update({ content: 'You have no data.', components: [] });
         }
 
-        // Group by album → puzzle
         const matchMap = {};
 
         for (const [otherId, otherData] of Object.entries(users)) {
@@ -425,8 +389,8 @@ client.on('interactionCreate', async interaction => {
               if (matches.length > 0) {
                 if (!matchMap[album]) matchMap[album] = {};
                 if (!matchMap[album][puzzle]) matchMap[album][puzzle] = [];
-                const verb = direction === 'have' ? 'needs' : 'has';
-                matchMap[album][puzzle].push(`${matches.join(', ')} — <@${otherId}> ${verb} ${direction === 'have' ? 'it' : 'it'}`);
+                const verb = direction === 'have' ? 'needs it' : 'has it';
+                matchMap[album][puzzle].push(`${matches.join(', ')} — <@${otherId}> ${verb}`);
               }
             }
           }
@@ -436,9 +400,8 @@ client.on('interactionCreate', async interaction => {
           return interaction.update({ content: 'No current matches found.', components: [] });
         }
 
-        // Format grouped by album
         const label = direction === 'have' ? 'Pieces I HAVE that others need' : 'Pieces I NEED that others have';
-        let body = '';
+        let body = `🔥 **${label}:**\n\n`;
         for (const album in matchMap) {
           body += `**${album}:**\n`;
           for (const puzzle in matchMap[album]) {
@@ -449,13 +412,9 @@ client.on('interactionCreate', async interaction => {
           body += '\n';
         }
 
-        const header = `🔥 **${label}:**`;
-        const full = header + '\n\n' + body.trim();
-
-        // Chunk and send
         const chunks = [];
         let current = '';
-        for (const line of full.split('\n')) {
+        for (const line of body.split('\n')) {
           if (current.length + line.length + 1 > 1900) { chunks.push(current); current = ''; }
           current += line + '\n';
         }
