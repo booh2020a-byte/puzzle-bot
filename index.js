@@ -1,4 +1,4 @@
-const { Client, GatewayIntentBits, ActionRowBuilder, StringSelectMenuBuilder } = require('discord.js');
+const { Client, GatewayIntentBits, ActionRowBuilder, StringSelectMenuBuilder, ButtonBuilder, ButtonStyle } = require('discord.js');
 require('dotenv').config();
 const { MongoClient } = require('mongodb');
 
@@ -111,13 +111,12 @@ function formatList(typeData) {
   if (!typeData || Object.keys(typeData).length === 0) return null;
 
   let msg = '';
-  for (const album in albumsData) {
-    if (!typeData[album]) continue;
+  for (const album in typeData) {
+    const puzzles = typeData[album];
+    if (Object.keys(puzzles).length === 0) continue;
     msg += `**${album}:**\n`;
-    for (const puzzle in albumsData[album]) {
-      const pieces = (typeData[album][puzzle] || [])
-        .map(p => p.piece)
-        .sort((a, b) => Number(a) - Number(b));
+    for (const puzzle in puzzles) {
+      const pieces = puzzles[puzzle].map(p => p.piece);
       if (pieces.length > 0) msg += `${puzzle}: ${pieces.join(', ')}\n`;
     }
     msg += '\n';
@@ -160,6 +159,15 @@ function piecesMenu(album, puzzle) {
   );
 }
 
+function submitButton(customId = 'submit') {
+  return new ActionRowBuilder().addComponents(
+    new ButtonBuilder()
+      .setCustomId(customId)
+      .setLabel('Submit')
+      .setStyle(ButtonStyle.Success)
+  );
+}
+
 function listTypeMenu() {
   return new ActionRowBuilder().addComponents(
     new StringSelectMenuBuilder()
@@ -196,6 +204,7 @@ async function savePieces(guildId, userId, type, album, puzzle, pieces) {
 
   const existing = users[userId][type][album][puzzle] || [];
 
+  // Keep existing pieces not in the new submission, then merge new ones
   const existingKept = existing.filter(p => !pieces.includes(p.piece));
   const newPieces = pieces.map(p => ({ piece: p, timestamp: now }));
 
@@ -381,7 +390,7 @@ client.on('interactionCreate', async interaction => {
                 if (!matchMap[album]) matchMap[album] = {};
                 if (!matchMap[album][puzzle]) matchMap[album][puzzle] = [];
                 const verb = direction === 'have' ? 'needs it' : 'has it';
-                matchMap[album][puzzle].push(`${matches.sort((a, b) => Number(a) - Number(b)).join(', ')} — <@${otherId}> ${verb}`);
+                matchMap[album][puzzle].push(`${matches.join(', ')} — <@${otherId}> ${verb}`);
               }
             }
           }
@@ -393,11 +402,9 @@ client.on('interactionCreate', async interaction => {
 
         const label = direction === 'have' ? 'Pieces I HAVE that others need' : 'Pieces I NEED that others have';
         let body = `🔥 **${label}:**\n\n`;
-        for (const album in albumsData) {
-          if (!matchMap[album]) continue;
+        for (const album in matchMap) {
           body += `**${album}:**\n`;
-          for (const puzzle in albumsData[album]) {
-            if (!matchMap[album]?.[puzzle]) continue;
+          for (const puzzle in matchMap[album]) {
             for (const line of matchMap[album][puzzle]) {
               body += `${puzzle}: ${line}\n`;
             }
@@ -459,7 +466,7 @@ client.on('interactionCreate', async interaction => {
         if (session.type === 'remove') {
           await removePieces(interaction.guildId, interaction.user.id, 'have', album, puzzle, pieces);
           await removePieces(interaction.guildId, interaction.user.id, 'need', album, puzzle, pieces);
-          return interaction.update({ content: `✅ Removed pieces from ${puzzle}`, components: [] });
+          return interaction.update({ content: `✅ Removed pieces from ${puzzle}`, components: [submitButton()] });
         } else {
           await savePieces(interaction.guildId, interaction.user.id, session.type, album, puzzle, pieces);
 
@@ -470,8 +477,18 @@ client.on('interactionCreate', async interaction => {
           }
 
           await checkMatch(interaction.guildId, interaction.user.id, session.type, album, puzzle, interaction.channel);
-          return interaction.update({ content: `✅ Updated ${puzzle}`, components: [] });
+          return interaction.update({ content: `✅ Updated ${puzzle}`, components: [submitButton()] });
         }
+      }
+    }
+
+    // ======================
+    // BUTTONS
+    // ======================
+    if (interaction.isButton()) {
+      if (interaction.customId === 'submit') {
+        delete servers[interaction.guildId].sessions[interaction.user.id];
+        return interaction.update({ content: '✅ Done!', components: [] });
       }
     }
 
