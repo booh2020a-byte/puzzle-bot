@@ -1,4 +1,4 @@
-const { Client, GatewayIntentBits, ActionRowBuilder, StringSelectMenuBuilder, ButtonBuilder, ButtonStyle, UserSelectMenuBuilder, EmbedBuilder } = require('discord.js');
+const { Client, GatewayIntentBits, ActionRowBuilder, StringSelectMenuBuilder, ButtonBuilder, ButtonStyle, UserSelectMenuBuilder } = require('discord.js');
 require('dotenv').config();
 const { MongoClient } = require('mongodb');
 
@@ -42,18 +42,9 @@ const client = new Client({
 // 📦 IN-MEMORY DATA
 // ======================
 const servers = {};
-const pendingTrades = {};
 
-// ======================
-// 🎨 COLORS
-// ======================
-const COLORS = {
-  purple: 0x9B59B6,
-  gold: 0xF1C40F,
-  green: 0x2ECC71,
-  red: 0xE74C3C,
-  blue: 0x3498DB,
-};
+// Pending trades: { tradeId: { guildId, userA, userB, album, puzzle, pieces, expiresAt } }
+const pendingTrades = {};
 
 // ======================
 // 📚 ALBUMS
@@ -117,47 +108,27 @@ function makePieces(n) {
 }
 
 // ======================
-// 🎨 EMBED BUILDERS
-// ======================
-function makeEmbed(color, title, description) {
-  return new EmbedBuilder()
-    .setColor(color)
-    .setTitle(title)
-    .setDescription(description)
-    .setTimestamp();
-}
-
-function makeFieldEmbed(color, title, description, fields) {
-  const embed = new EmbedBuilder()
-    .setColor(color)
-    .setTitle(title)
-    .setTimestamp();
-  if (description) embed.setDescription(description);
-  if (fields && fields.length > 0) embed.addFields(fields);
-  return embed;
-}
-
-// ======================
 // HELPERS
 // ======================
 function formatList(typeData) {
   if (!typeData || Object.keys(typeData).length === 0) return null;
 
-  const fields = [];
+  let msg = '';
   for (const album in albumsData) {
     if (!typeData[album]) continue;
-    let albumText = '';
+    msg += `**${album}:**\n`;
     for (const puzzle in albumsData[album]) {
       const pieces = (typeData[album][puzzle] || [])
         .map(p => p.piece)
         .sort((a, b) => Number(a) - Number(b));
-      if (pieces.length > 0) albumText += `**${puzzle}:** ${pieces.join(', ')}\n`;
+      if (pieces.length > 0) msg += `${puzzle}: ${pieces.join(', ')}\n`;
     }
-    if (albumText) fields.push({ name: `🗂️ ${album}`, value: albumText.trim() });
+    msg += '\n';
   }
-  return fields.length > 0 ? fields : null;
+  return msg.trim() || null;
 }
 
+// Get matched albums between two users (both directions)
 function getMatchedAlbums(userA, userB) {
   const matched = [];
   for (const album in albumsData) {
@@ -178,6 +149,7 @@ function getMatchedAlbums(userA, userB) {
   return matched;
 }
 
+// Get matched puzzles for a given album between two users (both directions)
 function getMatchedPuzzles(userA, userB, album) {
   const matched = [];
   for (const puzzle in albumsData[album]) {
@@ -194,6 +166,7 @@ function getMatchedPuzzles(userA, userB, album) {
   return matched;
 }
 
+// Get matched pieces for a given album/puzzle between two users (both directions)
 function getMatchedPieces(userA, userB, album, puzzle) {
   const aPieces = (userA.have?.[album]?.[puzzle] || []).map(p => p.piece);
   const bPieces = (userB.need?.[album]?.[puzzle] || []).map(p => p.piece);
@@ -371,18 +344,9 @@ async function checkMatch(guildId, userId, type, album, puzzle, channel) {
     const otherPieces = (data?.[opposite]?.[album]?.[puzzle] || []).map(p => p.piece);
     const matches = myPieces.filter(p => otherPieces.includes(p));
     if (matches.length > 0 && channel) {
-      const embed = makeFieldEmbed(
-        COLORS.gold,
-        '🔥 New Match Found!',
-        null,
-        [
-          { name: '👤 Users', value: `<@${userId}> (${type}) ↔ <@${otherId}> (${opposite})`, inline: false },
-          { name: '🗂️ Album', value: album, inline: true },
-          { name: '🧩 Puzzle', value: puzzle, inline: true },
-          { name: '🔢 Pieces', value: matches.join(', '), inline: false }
-        ]
+      await channel.send(
+        `🔥 MATCH!\n<@${userId}> (${type}) ↔ <@${otherId}> (${opposite})\nAlbum: ${album}\nPuzzle: ${puzzle}\nPieces: ${matches.join(', ')}`
       );
-      await channel.send({ embeds: [embed] });
     }
   }
 }
@@ -432,24 +396,28 @@ client.on('interactionCreate', async interaction => {
         session.type = interaction.commandName === 'remove' ? 'remove' : interaction.commandName;
         session.album = null;
         session.puzzle = null;
-        const embed = makeEmbed(COLORS.purple, '🧩 Puzzle Bot', 'Select an album to continue:');
-        return interaction.reply({ embeds: [embed], components: [albumMenu()], ephemeral: true });
+        return interaction.reply({ content: 'Select album:', components: [albumMenu()], ephemeral: true });
       }
 
       if (interaction.commandName === 'list') {
-        const embed = makeEmbed(COLORS.purple, '📋 Your Lists', 'Which list do you want to see?');
-        return interaction.reply({ embeds: [embed], components: [listTypeMenu()], ephemeral: true });
+        return interaction.reply({
+          content: 'Which list do you want to see?',
+          components: [listTypeMenu()],
+          ephemeral: true
+        });
       }
 
       if (interaction.commandName === 'matches') {
-        const embed = makeEmbed(COLORS.purple, '🔥 Your Matches', 'Which matches do you want to see?');
-        return interaction.reply({ embeds: [embed], components: [matchesTypeMenu()], ephemeral: true });
+        return interaction.reply({
+          content: 'Which matches do you want to see?',
+          components: [matchesTypeMenu()],
+          ephemeral: true
+        });
       }
 
       if (interaction.commandName === 'clear') {
-        const embed = makeEmbed(COLORS.purple, '🗑️ Clear List', 'Which list do you want to clear?');
         return interaction.reply({
-          embeds: [embed],
+          content: 'Which list do you want to clear?',
           components: [
             new ActionRowBuilder().addComponents(
               new StringSelectMenuBuilder()
@@ -468,8 +436,11 @@ client.on('interactionCreate', async interaction => {
 
       if (interaction.commandName === 'trade') {
         session.tradeStep = 'selectUser';
-        const embed = makeEmbed(COLORS.purple, '🤝 Start a Trade', 'Who are you trading with?');
-        return interaction.reply({ embeds: [embed], components: [tradeUserMenu()], ephemeral: true });
+        return interaction.reply({
+          content: '🤝 Who are you trading with?',
+          components: [tradeUserMenu()],
+          ephemeral: true
+        });
       }
     }
 
@@ -484,34 +455,28 @@ client.on('interactionCreate', async interaction => {
         const userBId = interaction.values[0];
 
         if (userBId === interaction.user.id) {
-          const embed = makeEmbed(COLORS.red, '❌ Invalid Trade', 'You cannot trade with yourself!');
-          return interaction.update({ embeds: [embed], components: [] });
+          return interaction.update({ content: '❌ You cannot trade with yourself!', components: [] });
         }
 
         const users = servers[interaction.guildId].users;
         const userA = users[interaction.user.id];
         const userB = users[userBId];
 
-        if (!userA) {
-          const embed = makeEmbed(COLORS.red, '❌ No Data', 'You have no data registered.');
-          return interaction.update({ embeds: [embed], components: [] });
-        }
-        if (!userB) {
-          const embed = makeEmbed(COLORS.red, '❌ No Data', `<@${userBId}> has no data registered.`);
-          return interaction.update({ embeds: [embed], components: [] });
-        }
+        if (!userA) return interaction.update({ content: '❌ You have no data registered.', components: [] });
+        if (!userB) return interaction.update({ content: '❌ That user has no data registered.', components: [] });
 
         const matchedAlbums = getMatchedAlbums(userA, userB);
         if (matchedAlbums.length === 0) {
-          const embed = makeEmbed(COLORS.red, '❌ No Matches', `You have no matches with <@${userBId}>.`);
-          return interaction.update({ embeds: [embed], components: [] });
+          return interaction.update({ content: `❌ You have no matches with <@${userBId}>.`, components: [] });
         }
 
         session.tradeUserB = userBId;
         session.tradeStep = 'selectAlbum';
 
-        const embed = makeEmbed(COLORS.purple, '🤝 Select Album', `Trading with <@${userBId}>.\nOnly albums with matches are shown.`);
-        return interaction.update({ embeds: [embed], components: [tradeAlbumMenu(matchedAlbums)] });
+        return interaction.update({
+          content: `Trading with <@${userBId}>. Select an album:`,
+          components: [tradeAlbumMenu(matchedAlbums)]
+        });
       }
 
       // TRADE ALBUM SELECT
@@ -523,13 +488,15 @@ client.on('interactionCreate', async interaction => {
 
         const matchedPuzzles = getMatchedPuzzles(userA, userB, album);
         if (matchedPuzzles.length === 0) {
-          const embed = makeEmbed(COLORS.red, '❌ No Matches', 'No matched puzzles in this album.');
-          return interaction.update({ embeds: [embed], components: [] });
+          return interaction.update({ content: '❌ No matched puzzles in this album.', components: [] });
         }
 
         session.tradeAlbum = album;
-        const embed = makeEmbed(COLORS.purple, '🤝 Select Puzzle', `**Album:** ${album}\nOnly puzzles with matches are shown.`);
-        return interaction.update({ embeds: [embed], components: [tradePuzzleMenu(matchedPuzzles)] });
+
+        return interaction.update({
+          content: `Album: **${album}**\nSelect a puzzle:`,
+          components: [tradePuzzleMenu(matchedPuzzles)]
+        });
       }
 
       // TRADE PUZZLE SELECT
@@ -541,13 +508,15 @@ client.on('interactionCreate', async interaction => {
 
         const matchedPieces = getMatchedPieces(userA, userB, session.tradeAlbum, puzzle);
         if (matchedPieces.length === 0) {
-          const embed = makeEmbed(COLORS.red, '❌ No Matches', 'No matched pieces in this puzzle.');
-          return interaction.update({ embeds: [embed], components: [] });
+          return interaction.update({ content: '❌ No matched pieces in this puzzle.', components: [] });
         }
 
         session.tradePuzzle = puzzle;
-        const embed = makeEmbed(COLORS.purple, '🤝 Select Pieces', `**Album:** ${session.tradeAlbum}\n**Puzzle:** ${puzzle}\nSelect the pieces you are trading:`);
-        return interaction.update({ embeds: [embed], components: [tradePiecesMenu(matchedPieces)] });
+
+        return interaction.update({
+          content: `Album: **${session.tradeAlbum}** | Puzzle: **${puzzle}**\nSelect the pieces you are trading:`,
+          components: [tradePiecesMenu(matchedPieces)]
+        });
       }
 
       // TRADE PIECES SELECT
@@ -566,31 +535,16 @@ client.on('interactionCreate', async interaction => {
           expiresAt
         };
 
-        const waitEmbed = makeFieldEmbed(
-          COLORS.purple,
-          '⏳ Trade Request Sent',
-          `Waiting for <@${session.tradeUserB}> to confirm. *(15 minutes)*`,
-          [
-            { name: '🗂️ Album', value: session.tradeAlbum, inline: true },
-            { name: '🧩 Puzzle', value: session.tradePuzzle, inline: true },
-            { name: '🔢 Pieces', value: pieces.join(', '), inline: false }
-          ]
-        );
+        await interaction.update({
+          content: `⏳ Trade request sent to <@${session.tradeUserB}>!\nWaiting for their confirmation *(15 minutes)*.\n\n**${session.tradeAlbum} → ${session.tradePuzzle}**\nPieces: ${pieces.join(', ')}`,
+          components: []
+        });
 
-        await interaction.update({ embeds: [waitEmbed], components: [] });
+        await interaction.channel.send({
+          content: `🤝 <@${session.tradeUserB}>, <@${interaction.user.id}> wants to trade with you!\n\n**${session.tradeAlbum} → ${session.tradePuzzle}**\nPieces: ${pieces.join(', ')}\n\nDo you confirm this trade? *(expires in 15 minutes)*`,
+          components: [tradeConfirmButtons(tradeId)]
+        });
 
-        const requestEmbed = makeFieldEmbed(
-          COLORS.gold,
-          '🤝 Trade Request!',
-          `<@${session.tradeUserB}>, <@${interaction.user.id}> wants to trade with you!\n\nDo you confirm? *(expires in 15 minutes)*`,
-          [
-            { name: '🗂️ Album', value: session.tradeAlbum, inline: true },
-            { name: '🧩 Puzzle', value: session.tradePuzzle, inline: true },
-            { name: '🔢 Pieces', value: pieces.join(', '), inline: false }
-          ]
-        );
-
-        await interaction.channel.send({ embeds: [requestEmbed], components: [tradeConfirmButtons(tradeId)] });
         return;
       }
 
@@ -599,25 +553,23 @@ client.on('interactionCreate', async interaction => {
         const type = interaction.values[0];
         const userData = servers[interaction.guildId]?.users[interaction.user.id];
         const typeData = userData?.[type];
-        const fields = formatList(typeData);
+        const formatted = formatList(typeData);
 
-        if (!fields) {
-          const embed = makeEmbed(COLORS.purple, `📋 Your ${type.toUpperCase()} List`, 'Your list is empty.');
-          return interaction.update({ embeds: [embed], components: [] });
+        if (!formatted) {
+          return interaction.update({ content: `Your **${type}** list is empty.`, components: [] });
         }
 
-        // Discord embeds support max 25 fields — chunk if needed
         const chunks = [];
-        for (let i = 0; i < fields.length; i += 25) {
-          chunks.push(fields.slice(i, i + 25));
+        let current = `📋 **Your ${type.toUpperCase()} list:**\n\n`;
+        for (const line of formatted.split('\n')) {
+          if (current.length + line.length + 1 > 1900) { chunks.push(current); current = ''; }
+          current += line + '\n';
         }
+        if (current.trim()) chunks.push(current);
 
-        const firstEmbed = makeFieldEmbed(COLORS.purple, `📋 Your ${type.toUpperCase()} List`, null, chunks[0]);
-        await interaction.update({ embeds: [firstEmbed], components: [] });
-
+        await interaction.update({ content: chunks[0], components: [] });
         for (let i = 1; i < chunks.length; i++) {
-          const embed = makeFieldEmbed(COLORS.purple, `📋 Your ${type.toUpperCase()} List (cont.)`, null, chunks[i]);
-          await interaction.followUp({ embeds: [embed], ephemeral: true });
+          await interaction.followUp({ content: chunks[i], ephemeral: true });
         }
         return;
       }
@@ -631,50 +583,60 @@ client.on('interactionCreate', async interaction => {
         const myData = users?.[userId];
 
         if (!myData) {
-          const embed = makeEmbed(COLORS.red, '❌ No Data', 'You have no data registered.');
-          return interaction.update({ embeds: [embed], components: [] });
+          return interaction.update({ content: 'You have no data.', components: [] });
         }
 
-        const fields = [];
+        const matchMap = {};
 
-        for (const album in albumsData) {
-          if (!myData[direction]?.[album]) continue;
-          let albumText = '';
-          for (const puzzle in albumsData[album]) {
-            if (!myData[direction][album]?.[puzzle]) continue;
-            const myPieces = myData[direction][album][puzzle].map(p => p.piece);
-            const allMatches = [];
-            for (const [otherId, otherData] of Object.entries(users)) {
-              if (otherId === userId) continue;
+        for (const [otherId, otherData] of Object.entries(users)) {
+          if (otherId === userId) continue;
+
+          for (const album in albumsData) {
+            if (!myData[direction]?.[album]) continue;
+            for (const puzzle in albumsData[album]) {
+              if (!myData[direction][album]?.[puzzle]) continue;
+              const myPieces = myData[direction][album][puzzle].map(p => p.piece);
               const theirPieces = (otherData[opposite]?.[album]?.[puzzle] || []).map(p => p.piece);
               const matches = myPieces.filter(p => theirPieces.includes(p));
               if (matches.length > 0) {
+                if (!matchMap[album]) matchMap[album] = {};
+                if (!matchMap[album][puzzle]) matchMap[album][puzzle] = [];
                 const verb = direction === 'have' ? 'needs it' : 'has it';
-                allMatches.push(`**${matches.sort((a, b) => Number(a) - Number(b)).join(', ')}** — <@${otherId}> ${verb}`);
+                matchMap[album][puzzle].push(`${matches.sort((a, b) => Number(a) - Number(b)).join(', ')} — <@${otherId}> ${verb}`);
               }
             }
-            if (allMatches.length > 0) {
-              albumText += `**${puzzle}:**\n${allMatches.join('\n')}\n`;
-            }
           }
-          if (albumText) fields.push({ name: `🗂️ ${album}`, value: albumText.trim() });
         }
 
-        if (fields.length === 0) {
-          const embed = makeEmbed(COLORS.purple, '🔥 Your Matches', 'No current matches found.');
-          return interaction.update({ embeds: [embed], components: [] });
+        if (Object.keys(matchMap).length === 0) {
+          return interaction.update({ content: 'No current matches found.', components: [] });
         }
 
         const label = direction === 'have' ? 'Pieces I HAVE that others need' : 'Pieces I NEED that others have';
+        let body = `🔥 **${label}:**\n\n`;
+        for (const album in albumsData) {
+          if (!matchMap[album]) continue;
+          body += `**${album}:**\n`;
+          for (const puzzle in albumsData[album]) {
+            if (!matchMap[album]?.[puzzle]) continue;
+            for (const line of matchMap[album][puzzle]) {
+              body += `${puzzle}: ${line}\n`;
+            }
+          }
+          body += '\n';
+        }
+
         const chunks = [];
-        for (let i = 0; i < fields.length; i += 25) chunks.push(fields.slice(i, i + 25));
+        let current = '';
+        for (const line of body.split('\n')) {
+          if (current.length + line.length + 1 > 1900) { chunks.push(current); current = ''; }
+          current += line + '\n';
+        }
+        if (current.trim()) chunks.push(current);
 
-        const firstEmbed = makeFieldEmbed(COLORS.gold, `🔥 ${label}`, null, chunks[0]);
-        await interaction.update({ embeds: [firstEmbed], components: [] });
-
+        await interaction.update({ content: chunks[0], components: [] });
         for (let i = 1; i < chunks.length; i++) {
-          const embed = makeFieldEmbed(COLORS.gold, `🔥 ${label} (cont.)`, null, chunks[i]);
-          await interaction.followUp({ embeds: [embed], ephemeral: true });
+          await interaction.followUp({ content: chunks[i], ephemeral: true });
         }
         return;
       }
@@ -683,10 +645,7 @@ client.on('interactionCreate', async interaction => {
       if (interaction.customId === 'clearMenu') {
         const choice = interaction.values[0];
         const user = servers[interaction.guildId].users[interaction.user.id];
-        if (!user) {
-          const embed = makeEmbed(COLORS.red, '❌ No Data', 'No data to clear.');
-          return interaction.update({ embeds: [embed], components: [] });
-        }
+        if (!user) return interaction.update({ content: 'No data to clear.', components: [] });
 
         if (choice === 'have' || choice === 'need') {
           user[choice] = {};
@@ -696,23 +655,20 @@ client.on('interactionCreate', async interaction => {
         }
 
         await saveData();
-        const embed = makeEmbed(COLORS.green, '✅ Cleared!', `Your **${choice}** list has been cleared.`);
-        return interaction.update({ embeds: [embed], components: [] });
+        return interaction.update({ content: `✅ Cleared ${choice}`, components: [] });
       }
 
       // ALBUM MENU
       if (interaction.customId === 'album') {
         session.album = interaction.values[0];
-        const embed = makeEmbed(COLORS.purple, '🧩 Puzzle Bot', `**Album:** ${session.album}\nNow select a puzzle:`);
-        return interaction.update({ embeds: [embed], components: [puzzleMenu(session.album)] });
+        return interaction.update({ content: `Album: ${session.album}`, components: [puzzleMenu(session.album)] });
       }
 
       // PUZZLE MENU
       if (parts[0] === 'puzzle') {
         session.album = parts[1];
         session.puzzle = interaction.values[0];
-        const embed = makeEmbed(COLORS.purple, '🧩 Puzzle Bot', `**Album:** ${session.album}\n**Puzzle:** ${session.puzzle}\nNow select your pieces:`);
-        return interaction.update({ embeds: [embed], components: [piecesMenu(parts[1], session.puzzle)] });
+        return interaction.update({ content: `Puzzle: ${session.puzzle}`, components: [piecesMenu(parts[1], session.puzzle)] });
       }
 
       // PIECES MENU
@@ -724,37 +680,18 @@ client.on('interactionCreate', async interaction => {
         if (session.type === 'remove') {
           await removePieces(interaction.guildId, interaction.user.id, 'have', album, puzzle, pieces);
           await removePieces(interaction.guildId, interaction.user.id, 'need', album, puzzle, pieces);
-          const embed = makeFieldEmbed(COLORS.green, '✅ Pieces Removed!', null, [
-            { name: '🗂️ Album', value: album, inline: true },
-            { name: '🧩 Puzzle', value: puzzle, inline: true },
-            { name: '🔢 Pieces', value: pieces.join(', '), inline: false }
-          ]);
-          return interaction.update({ embeds: [embed], components: [] });
+          return interaction.update({ content: `✅ Removed pieces from ${puzzle}`, components: [] });
         } else {
           await savePieces(interaction.guildId, interaction.user.id, session.type, album, puzzle, pieces);
 
           if (interaction.channel) {
-            const updateEmbed = makeFieldEmbed(
-              COLORS.purple,
-              '📦 List Updated',
-              `<@${interaction.user.id}> updated their **${session.type}** list`,
-              [
-                { name: '🗂️ Album', value: album, inline: true },
-                { name: '🧩 Puzzle', value: puzzle, inline: true },
-                { name: '🔢 Pieces', value: pieces.join(', '), inline: false }
-              ]
+            await interaction.channel.send(
+              `📦 <@${interaction.user.id}> updated their ${session.type} list for ${puzzle}: ${pieces.join(', ')}`
             );
-            await interaction.channel.send({ embeds: [updateEmbed] });
           }
 
           await checkMatch(interaction.guildId, interaction.user.id, session.type, album, puzzle, interaction.channel);
-
-          const embed = makeFieldEmbed(COLORS.green, '✅ List Updated!', null, [
-            { name: '🗂️ Album', value: album, inline: true },
-            { name: '🧩 Puzzle', value: puzzle, inline: true },
-            { name: '🔢 Pieces', value: pieces.join(', '), inline: false }
-          ]);
-          return interaction.update({ embeds: [embed], components: [] });
+          return interaction.update({ content: `✅ Updated ${puzzle}`, components: [] });
         }
       }
     }
@@ -771,29 +708,19 @@ client.on('interactionCreate', async interaction => {
         const trade = pendingTrades[tradeId];
 
         if (!trade) {
-          const embed = makeEmbed(COLORS.red, '❌ Expired', 'This trade has expired or no longer exists.');
-          return interaction.reply({ embeds: [embed], ephemeral: true });
+          return interaction.reply({ content: '❌ This trade has expired or no longer exists.', ephemeral: true });
         }
         if (interaction.user.id !== trade.userB) {
-          const embed = makeEmbed(COLORS.red, '❌ Not Your Trade', 'This trade request is not for you.');
-          return interaction.reply({ embeds: [embed], ephemeral: true });
+          return interaction.reply({ content: '❌ This trade request is not for you.', ephemeral: true });
         }
 
         if (parts[0] === 'tradeDecline') {
           delete pendingTrades[tradeId];
-          const declineEmbed = makeFieldEmbed(
-            COLORS.red,
-            '❌ Trade Declined',
-            `<@${trade.userB}> declined the trade with <@${trade.userA}>.`,
-            [
-              { name: '🗂️ Album', value: trade.album, inline: true },
-              { name: '🧩 Puzzle', value: trade.puzzle, inline: true },
-              { name: '🔢 Pieces', value: trade.pieces.join(', '), inline: false }
-            ]
-          );
-          await interaction.update({ embeds: [declineEmbed], components: [] });
-          const notifyEmbed = makeEmbed(COLORS.red, '❌ Trade Declined', `<@${trade.userA}> your trade request was declined by <@${trade.userB}>.`);
-          await interaction.channel.send({ embeds: [notifyEmbed] });
+          await interaction.update({
+            content: `❌ <@${trade.userB}> declined the trade with <@${trade.userA}>.\n\n**${trade.album} → ${trade.puzzle}**\nPieces: ${trade.pieces.join(', ')}`,
+            components: []
+          });
+          await interaction.channel.send(`<@${trade.userA}> your trade request was declined by <@${trade.userB}>. ❌`);
           return;
         }
 
@@ -806,20 +733,11 @@ client.on('interactionCreate', async interaction => {
           await removePieces(guildId, userB, 'have', album, puzzle, pieces);
           await removePieces(guildId, userB, 'need', album, puzzle, pieces);
 
-          const confirmEmbed = makeFieldEmbed(
-            COLORS.green,
-            '✅ Trade Confirmed!',
-            `<@${userA}> and <@${userB}> completed a trade!`,
-            [
-              { name: '🗂️ Album', value: album, inline: true },
-              { name: '🧩 Puzzle', value: puzzle, inline: true },
-              { name: '🔢 Pieces Traded', value: pieces.join(', '), inline: false }
-            ]
-          );
-          await interaction.update({ embeds: [confirmEmbed], components: [] });
-
-          const celebEmbed = makeEmbed(COLORS.green, '🎉 Trade Complete!', `<@${userA}> <@${userB}> your trade is done! Pieces **${pieces.join(', ')}** from **${puzzle}** have been removed from both your lists.`);
-          await interaction.channel.send({ embeds: [celebEmbed] });
+          await interaction.update({
+            content: `✅ Trade confirmed between <@${userA}> and <@${userB}>!\n\n**${album} → ${puzzle}**\nPieces traded: ${pieces.join(', ')}`,
+            components: []
+          });
+          await interaction.channel.send(`🎉 <@${userA}> <@${userB}> your trade is complete! Pieces **${pieces.join(', ')}** from **${puzzle}** have been removed from both your lists.`);
           return;
         }
       }
@@ -829,8 +747,7 @@ client.on('interactionCreate', async interaction => {
     console.error("❌ Erro na interação:", err);
     try {
       if (interaction.replied || interaction.deferred) return;
-      const embed = makeEmbed(COLORS.red, '❌ Something went wrong', 'Please try again.');
-      await interaction.reply({ embeds: [embed], ephemeral: true });
+      await interaction.reply({ content: '❌ Algo deu errado. Tente novamente.', ephemeral: true });
     } catch (_) {}
   }
 });
