@@ -128,6 +128,39 @@ function formatList(typeData) {
   return msg.trim() || null;
 }
 
+// Get albums where user has any data (have or need)
+function getUserAlbums(userData) {
+  const albums = [];
+  for (const album in albumsData) {
+    const hasHave = Object.keys(userData.have?.[album] || {}).some(
+      puzzle => (userData.have[album][puzzle] || []).length > 0
+    );
+    const hasNeed = Object.keys(userData.need?.[album] || {}).some(
+      puzzle => (userData.need[album][puzzle] || []).length > 0
+    );
+    if (hasHave || hasNeed) albums.push(album);
+  }
+  return albums;
+}
+
+// Get puzzles where user has any data (have or need) for a given album
+function getUserPuzzles(userData, album) {
+  const puzzles = [];
+  for (const puzzle in albumsData[album]) {
+    const haveCount = (userData.have?.[album]?.[puzzle] || []).length;
+    const needCount = (userData.need?.[album]?.[puzzle] || []).length;
+    if (haveCount > 0 || needCount > 0) puzzles.push(puzzle);
+  }
+  return puzzles;
+}
+
+// Get all pieces user has registered (have + need combined, deduplicated) for a puzzle
+function getUserPieces(userData, album, puzzle) {
+  const havePieces = (userData.have?.[album]?.[puzzle] || []).map(p => p.piece);
+  const needPieces = (userData.need?.[album]?.[puzzle] || []).map(p => p.piece);
+  return [...new Set([...havePieces, ...needPieces])].sort((a, b) => Number(a) - Number(b));
+}
+
 // Get matched albums between two users (both directions)
 function getMatchedAlbums(userA, userB) {
   const matched = [];
@@ -200,12 +233,30 @@ function albumMenu() {
   );
 }
 
+function removeAlbumMenu(albums) {
+  return new ActionRowBuilder().addComponents(
+    new StringSelectMenuBuilder()
+      .setCustomId('removeAlbum')
+      .setPlaceholder('Select album')
+      .addOptions(albums.map(a => ({ label: a, value: a })))
+  );
+}
+
 function puzzleMenu(album) {
   return new ActionRowBuilder().addComponents(
     new StringSelectMenuBuilder()
       .setCustomId(`puzzle|${album}`)
       .setPlaceholder('Select puzzle')
       .addOptions(Object.keys(albumsData[album]).map(p => ({ label: p, value: p })))
+  );
+}
+
+function removePuzzleMenu(puzzles, album) {
+  return new ActionRowBuilder().addComponents(
+    new StringSelectMenuBuilder()
+      .setCustomId(`removePuzzle|${album}`)
+      .setPlaceholder('Select puzzle')
+      .addOptions(puzzles.map(p => ({ label: p, value: p })))
   );
 }
 
@@ -217,6 +268,17 @@ function piecesMenu(album, puzzle) {
     new StringSelectMenuBuilder()
       .setCustomId(`pieces|${album}|${puzzle}`)
       .setPlaceholder('Select pieces')
+      .setMinValues(1)
+      .setMaxValues(pieces.length)
+      .addOptions(pieces.map(p => ({ label: p, value: p })))
+  );
+}
+
+function removePiecesMenu(pieces, album, puzzle) {
+  return new ActionRowBuilder().addComponents(
+    new StringSelectMenuBuilder()
+      .setCustomId(`removePieces|${album}|${puzzle}`)
+      .setPlaceholder('Select pieces to remove')
       .setMinValues(1)
       .setMaxValues(pieces.length)
       .addOptions(pieces.map(p => ({ label: p, value: p })))
@@ -392,11 +454,26 @@ client.on('interactionCreate', async interaction => {
     // ======================
     if (interaction.isChatInputCommand()) {
 
-      if (interaction.commandName === 'have' || interaction.commandName === 'need' || interaction.commandName === 'remove') {
-        session.type = interaction.commandName === 'remove' ? 'remove' : interaction.commandName;
+      if (interaction.commandName === 'have' || interaction.commandName === 'need') {
+        session.type = interaction.commandName;
         session.album = null;
         session.puzzle = null;
         return interaction.reply({ content: 'Select album:', components: [albumMenu()], ephemeral: true });
+      }
+
+      if (interaction.commandName === 'remove') {
+        const userData = servers[interaction.guildId]?.users[interaction.user.id];
+        if (!userData) return interaction.reply({ content: '❌ You have no data to remove.', ephemeral: true });
+
+        const albums = getUserAlbums(userData);
+        if (albums.length === 0) return interaction.reply({ content: '❌ You have no data to remove.', ephemeral: true });
+
+        session.type = 'remove';
+        return interaction.reply({
+          content: 'Select album:',
+          components: [removeAlbumMenu(albums)],
+          ephemeral: true
+        });
       }
 
       if (interaction.commandName === 'list') {
@@ -449,6 +526,53 @@ client.on('interactionCreate', async interaction => {
     // ======================
     if (interaction.isStringSelectMenu() || interaction.isUserSelectMenu()) {
       const parts = interaction.customId.split('|');
+
+      // REMOVE ALBUM MENU
+      if (interaction.customId === 'removeAlbum') {
+        const album = interaction.values[0];
+        const userData = servers[interaction.guildId]?.users[interaction.user.id];
+        const puzzles = getUserPuzzles(userData, album);
+
+        if (puzzles.length === 0) {
+          return interaction.update({ content: '❌ No data in this album.', components: [] });
+        }
+
+        session.removeAlbum = album;
+        return interaction.update({
+          content: `Album: **${album}**\nSelect a puzzle:`,
+          components: [removePuzzleMenu(puzzles, album)]
+        });
+      }
+
+      // REMOVE PUZZLE MENU
+      if (parts[0] === 'removePuzzle') {
+        const album = parts[1];
+        const puzzle = interaction.values[0];
+        const userData = servers[interaction.guildId]?.users[interaction.user.id];
+        const pieces = getUserPieces(userData, album, puzzle);
+
+        if (pieces.length === 0) {
+          return interaction.update({ content: '❌ No pieces in this puzzle.', components: [] });
+        }
+
+        session.removeAlbum = album;
+        session.removePuzzle = puzzle;
+        return interaction.update({
+          content: `Album: **${album}** | Puzzle: **${puzzle}**\nSelect pieces to remove:`,
+          components: [removePiecesMenu(pieces, album, puzzle)]
+        });
+      }
+
+      // REMOVE PIECES MENU
+      if (parts[0] === 'removePieces') {
+        const album = parts[1];
+        const puzzle = parts[2];
+        const pieces = interaction.values;
+
+        await removePieces(interaction.guildId, interaction.user.id, 'have', album, puzzle, pieces);
+        await removePieces(interaction.guildId, interaction.user.id, 'need', album, puzzle, pieces);
+        return interaction.update({ content: `✅ Removed pieces **${pieces.join(', ')}** from **${puzzle}**`, components: [] });
+      }
 
       // TRADE USER SELECT
       if (interaction.customId === 'tradeUser') {
@@ -677,22 +801,16 @@ client.on('interactionCreate', async interaction => {
         const puzzle = parts[2];
         const pieces = interaction.values;
 
-        if (session.type === 'remove') {
-          await removePieces(interaction.guildId, interaction.user.id, 'have', album, puzzle, pieces);
-          await removePieces(interaction.guildId, interaction.user.id, 'need', album, puzzle, pieces);
-          return interaction.update({ content: `✅ Removed pieces from ${puzzle}`, components: [] });
-        } else {
-          await savePieces(interaction.guildId, interaction.user.id, session.type, album, puzzle, pieces);
+        await savePieces(interaction.guildId, interaction.user.id, session.type, album, puzzle, pieces);
 
-          if (interaction.channel) {
-            await interaction.channel.send(
-              `📦 <@${interaction.user.id}> updated their ${session.type} list for ${puzzle}: ${pieces.join(', ')}`
-            );
-          }
-
-          await checkMatch(interaction.guildId, interaction.user.id, session.type, album, puzzle, interaction.channel);
-          return interaction.update({ content: `✅ Updated ${puzzle}`, components: [] });
+        if (interaction.channel) {
+          await interaction.channel.send(
+            `📦 <@${interaction.user.id}> updated their ${session.type} list for ${puzzle}: ${pieces.join(', ')}`
+          );
         }
+
+        await checkMatch(interaction.guildId, interaction.user.id, session.type, album, puzzle, interaction.channel);
+        return interaction.update({ content: `✅ Updated ${puzzle}`, components: [] });
       }
     }
 
