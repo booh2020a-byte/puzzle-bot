@@ -32,6 +32,30 @@ async function connectDB() {
 }
 
 // ======================
+// 🔄 MIGRATIONS
+// ======================
+async function runMigrations() {
+  let changed = false;
+
+  for (const guild of Object.values(servers)) {
+    for (const user of Object.values(guild.users || {})) {
+      for (const type of ['have', 'need']) {
+        if (user[type]?.BalladOfWindAndCold?.ColdHighways) {
+          user[type].BalladOfWindAndCold.FrostwindTrack = user[type].BalladOfWindAndCold.ColdHighways;
+          delete user[type].BalladOfWindAndCold.ColdHighways;
+          changed = true;
+        }
+      }
+    }
+  }
+
+  if (changed) {
+    await saveData();
+    console.log("✅ Migration complete: ColdHighways → FrostwindTrack");
+  }
+}
+
+// ======================
 // 📦 DISCORD CLIENT
 // ======================
 const client = new Client({
@@ -52,7 +76,7 @@ const pendingTrades = {};
 const albumsData = {
   BalladOfWindAndCold: {
     HonorAndGlory: 12,
-    ColdHighways: 14,
+    FrostwindTrack: 14,
     WordsOfTheForgotten: 14,
     MonumentToTheFlames: 13,
     AllianceShowdown: 12,
@@ -458,21 +482,21 @@ client.on('interactionCreate', async interaction => {
         session.type = interaction.commandName;
         session.album = null;
         session.puzzle = null;
-        return interaction.reply({ content: 'Select album:', components: [albumMenu()], ephemeral: true });
+        return interaction.reply({ content: 'Select album:', components: [albumMenu()], flags: 64 });
       }
 
       if (interaction.commandName === 'remove') {
         const userData = servers[interaction.guildId]?.users[interaction.user.id];
-        if (!userData) return interaction.reply({ content: '❌ You have no data to remove.', ephemeral: true });
+        if (!userData) return interaction.reply({ content: '❌ You have no data to remove.', flags: 64 });
 
         const albums = getUserAlbums(userData);
-        if (albums.length === 0) return interaction.reply({ content: '❌ You have no data to remove.', ephemeral: true });
+        if (albums.length === 0) return interaction.reply({ content: '❌ You have no data to remove.', flags: 64 });
 
         session.type = 'remove';
         return interaction.reply({
           content: 'Select album:',
           components: [removeAlbumMenu(albums)],
-          ephemeral: true
+          flags: 64
         });
       }
 
@@ -480,7 +504,7 @@ client.on('interactionCreate', async interaction => {
         return interaction.reply({
           content: 'Which list do you want to see?',
           components: [listTypeMenu()],
-          ephemeral: true
+          flags: 64
         });
       }
 
@@ -488,7 +512,7 @@ client.on('interactionCreate', async interaction => {
         return interaction.reply({
           content: 'Which matches do you want to see?',
           components: [matchesTypeMenu()],
-          ephemeral: true
+          flags: 64
         });
       }
 
@@ -507,7 +531,7 @@ client.on('interactionCreate', async interaction => {
                 ])
             )
           ],
-          ephemeral: true
+          flags: 64
         });
       }
 
@@ -516,7 +540,7 @@ client.on('interactionCreate', async interaction => {
         return interaction.reply({
           content: '🤝 Who are you trading with?',
           components: [tradeUserMenu()],
-          ephemeral: true
+          flags: 64
         });
       }
     }
@@ -569,9 +593,10 @@ client.on('interactionCreate', async interaction => {
         const puzzle = parts[2];
         const pieces = interaction.values;
 
+        await interaction.deferUpdate();
         await removePieces(interaction.guildId, interaction.user.id, 'have', album, puzzle, pieces);
         await removePieces(interaction.guildId, interaction.user.id, 'need', album, puzzle, pieces);
-        return interaction.update({ content: `✅ Removed pieces **${pieces.join(', ')}** from **${puzzle}**`, components: [] });
+        return interaction.editReply({ content: `✅ Removed pieces **${pieces.join(', ')}** from **${puzzle}**`, components: [] });
       }
 
       // TRADE USER SELECT
@@ -616,7 +641,6 @@ client.on('interactionCreate', async interaction => {
         }
 
         session.tradeAlbum = album;
-
         return interaction.update({
           content: `Album: **${album}**\nSelect a puzzle:`,
           components: [tradePuzzleMenu(matchedPuzzles)]
@@ -636,7 +660,6 @@ client.on('interactionCreate', async interaction => {
         }
 
         session.tradePuzzle = puzzle;
-
         return interaction.update({
           content: `Album: **${session.tradeAlbum}** | Puzzle: **${puzzle}**\nSelect the pieces you are trading:`,
           components: [tradePiecesMenu(matchedPieces)]
@@ -693,7 +716,7 @@ client.on('interactionCreate', async interaction => {
 
         await interaction.update({ content: chunks[0], components: [] });
         for (let i = 1; i < chunks.length; i++) {
-          await interaction.followUp({ content: chunks[i], ephemeral: true });
+          await interaction.followUp({ content: chunks[i], flags: 64 });
         }
         return;
       }
@@ -760,7 +783,7 @@ client.on('interactionCreate', async interaction => {
 
         await interaction.update({ content: chunks[0], components: [] });
         for (let i = 1; i < chunks.length; i++) {
-          await interaction.followUp({ content: chunks[i], ephemeral: true });
+          await interaction.followUp({ content: chunks[i], flags: 64 });
         }
         return;
       }
@@ -801,6 +824,8 @@ client.on('interactionCreate', async interaction => {
         const puzzle = parts[2];
         const pieces = interaction.values;
 
+        await interaction.deferUpdate();
+
         await savePieces(interaction.guildId, interaction.user.id, session.type, album, puzzle, pieces);
 
         if (interaction.channel) {
@@ -810,7 +835,7 @@ client.on('interactionCreate', async interaction => {
         }
 
         await checkMatch(interaction.guildId, interaction.user.id, session.type, album, puzzle, interaction.channel);
-        return interaction.update({ content: `✅ Updated ${puzzle}`, components: [] });
+        return interaction.editReply({ content: `✅ Updated ${puzzle}`, components: [] });
       }
     }
 
@@ -826,10 +851,10 @@ client.on('interactionCreate', async interaction => {
         const trade = pendingTrades[tradeId];
 
         if (!trade) {
-          return interaction.reply({ content: '❌ This trade has expired or no longer exists.', ephemeral: true });
+          return interaction.reply({ content: '❌ This trade has expired or no longer exists.', flags: 64 });
         }
         if (interaction.user.id !== trade.userB) {
-          return interaction.reply({ content: '❌ This trade request is not for you.', ephemeral: true });
+          return interaction.reply({ content: '❌ This trade request is not for you.', flags: 64 });
         }
 
         if (parts[0] === 'tradeDecline') {
@@ -865,7 +890,7 @@ client.on('interactionCreate', async interaction => {
     console.error("❌ Erro na interação:", err);
     try {
       if (interaction.replied || interaction.deferred) return;
-      await interaction.reply({ content: '❌ Algo deu errado. Tente novamente.', ephemeral: true });
+      await interaction.reply({ content: '❌ Algo deu errado. Tente novamente.', flags: 64 });
     } catch (_) {}
   }
 });
@@ -875,6 +900,7 @@ client.on('interactionCreate', async interaction => {
 // ======================
 async function start() {
   await connectDB();
+  await runMigrations();
   await client.login(process.env.TOKEN);
 }
 
