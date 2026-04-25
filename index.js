@@ -10,6 +10,7 @@ const mongoClient = new MongoClient(process.env.MONGO_URI, {
   tlsAllowInvalidCertificates: true,
 });
 let memoryCollection;
+let logsCollection;
 
 async function connectDB() {
   try {
@@ -17,6 +18,7 @@ async function connectDB() {
     console.log("✅ Conectado ao MongoDB!");
     const db = mongoClient.db("puzzleBotDB");
     memoryCollection = db.collection("serversMemory");
+    logsCollection = db.collection("adminLogs");
 
     const saved = await memoryCollection.findOne({ key: 'servers' });
     if (!saved) {
@@ -66,8 +68,6 @@ const client = new Client({
 // 📦 IN-MEMORY DATA
 // ======================
 const servers = {};
-
-// Pending trades: { tradeId: { guildId, userA, userB, album, puzzle, pieces, expiresAt } }
 const pendingTrades = {};
 
 // ======================
@@ -121,6 +121,23 @@ async function saveData() {
   );
 }
 
+async function writeLog(guildId, adminId, adminTag, targetId, targetTag, action) {
+  if (!logsCollection) return;
+  await logsCollection.insertOne({
+    guildId,
+    adminId,
+    adminTag,
+    targetId,
+    targetTag,
+    action,
+    timestamp: new Date()
+  });
+  // Auto-purge logs older than 60 days
+  const cutoff = new Date();
+  cutoff.setDate(cutoff.getDate() - 60);
+  await logsCollection.deleteMany({ timestamp: { $lt: cutoff } });
+}
+
 function ensureServer(guildId) {
   if (!servers[guildId]) {
     servers[guildId] = { users: {}, sessions: {} };
@@ -129,6 +146,10 @@ function ensureServer(guildId) {
 
 function makePieces(n) {
   return Array.from({ length: n }, (_, i) => (i + 1).toString());
+}
+
+function isAdmin(member) {
+  return member.permissions.has('ManageGuild');
 }
 
 // ======================
@@ -152,7 +173,6 @@ function formatList(typeData) {
   return msg.trim() || null;
 }
 
-// Get albums where user has any data (have or need)
 function getUserAlbums(userData) {
   const albums = [];
   for (const album in albumsData) {
@@ -167,7 +187,6 @@ function getUserAlbums(userData) {
   return albums;
 }
 
-// Get puzzles where user has any data (have or need) for a given album
 function getUserPuzzles(userData, album) {
   const puzzles = [];
   for (const puzzle in albumsData[album]) {
@@ -178,14 +197,12 @@ function getUserPuzzles(userData, album) {
   return puzzles;
 }
 
-// Get all pieces user has registered (have + need combined, deduplicated) for a puzzle
 function getUserPieces(userData, album, puzzle) {
   const havePieces = (userData.have?.[album]?.[puzzle] || []).map(p => p.piece);
   const needPieces = (userData.need?.[album]?.[puzzle] || []).map(p => p.piece);
   return [...new Set([...havePieces, ...needPieces])].sort((a, b) => Number(a) - Number(b));
 }
 
-// Get matched albums between two users (both directions)
 function getMatchedAlbums(userA, userB) {
   const matched = [];
   for (const album in albumsData) {
@@ -206,7 +223,6 @@ function getMatchedAlbums(userA, userB) {
   return matched;
 }
 
-// Get matched puzzles for a given album between two users (both directions)
 function getMatchedPuzzles(userA, userB, album) {
   const matched = [];
   for (const puzzle in albumsData[album]) {
@@ -223,7 +239,6 @@ function getMatchedPuzzles(userA, userB, album) {
   return matched;
 }
 
-// Get matched pieces for a given album/puzzle between two users (both directions)
 function getMatchedPieces(userA, userB, album, puzzle) {
   const aPieces = (userA.have?.[album]?.[puzzle] || []).map(p => p.piece);
   const bPieces = (userB.need?.[album]?.[puzzle] || []).map(p => p.piece);
@@ -243,6 +258,78 @@ function cleanExpiredTrades() {
       delete pendingTrades[tradeId];
     }
   }
+}
+
+// Build expire list text (paginated, 10 per page)
+function buildExpirePage(entries, page) {
+  const perPage = 10;
+  const start = page * perPage;
+  const slice = entries.slice(start, start + perPage);
+  const totalPages = Math.ceil(entries.length / perPage);
+
+  let msg = `📋 **User Data Expiry** (Page ${page + 1}/${totalPages}):\n\n`;
+  for (const e of slice) {
+    const daysLeft = e.daysLeft;
+    const warning = daysLeft <= 3 ? ' ⚠️' : '';
+    msg += `<@${e.userId}> — **${daysLeft}** day(s) until cleanup${warning}\n`;
+  }
+  return msg;
+}
+
+function expirePageButtons(page, totalPages, guildId) {
+  const row = new ActionRowBuilder();
+  if (page > 0) {
+    row.addComponents(
+      new ButtonBuilder()
+        .setCustomId(`expirePage|${guildId}|${page - 1}`)
+        .setLabel('◀ Previous')
+        .setStyle(ButtonStyle.Secondary)
+    );
+  }
+  if (page < totalPages - 1) {
+    row.addComponents(
+      new ButtonBuilder()
+        .setCustomId(`expirePage|${guildId}|${page + 1}`)
+        .setLabel('Next ▶')
+        .setStyle(ButtonStyle.Secondary)
+    );
+  }
+  return row.components.length > 0 ? row : null;
+}
+
+function buildLogsPage(logs, page) {
+  const perPage = 10;
+  const start = page * perPage;
+  const slice = logs.slice(start, start + perPage);
+  const totalPages = Math.ceil(logs.length / perPage);
+
+  let msg = `📋 **Admin Deletion Logs** (Page ${page + 1}/${totalPages}):\n\n`;
+  for (const log of slice) {
+    const date = new Date(log.timestamp).toLocaleString('en-GB', { dateStyle: 'medium', timeStyle: 'short' });
+    msg += `**Admin:** ${log.adminTag}\n**Deleted:** <@${log.targetId}>'s **${log.action}** list\n**When:** ${date}\n\n`;
+  }
+  return msg;
+}
+
+function logsPageButtons(page, totalPages, guildId) {
+  const row = new ActionRowBuilder();
+  if (page > 0) {
+    row.addComponents(
+      new ButtonBuilder()
+        .setCustomId(`logsPage|${guildId}|${page - 1}`)
+        .setLabel('◀ Previous')
+        .setStyle(ButtonStyle.Secondary)
+    );
+  }
+  if (page < totalPages - 1) {
+    row.addComponents(
+      new ButtonBuilder()
+        .setCustomId(`logsPage|${guildId}|${page + 1}`)
+        .setLabel('Next ▶')
+        .setStyle(ButtonStyle.Secondary)
+    );
+  }
+  return row.components.length > 0 ? row : null;
 }
 
 // ======================
@@ -338,6 +425,27 @@ function tradeUserMenu() {
     new UserSelectMenuBuilder()
       .setCustomId('tradeUser')
       .setPlaceholder('Select the user you are trading with')
+  );
+}
+
+function adminDeleteUserMenu() {
+  return new ActionRowBuilder().addComponents(
+    new UserSelectMenuBuilder()
+      .setCustomId('adminDeleteUser')
+      .setPlaceholder('Select user to delete data for')
+  );
+}
+
+function adminDeleteTypeMenu(targetId) {
+  return new ActionRowBuilder().addComponents(
+    new StringSelectMenuBuilder()
+      .setCustomId(`adminDeleteType|${targetId}`)
+      .setPlaceholder('What to delete?')
+      .addOptions([
+        { label: 'Have list', value: 'have' },
+        { label: 'Need list', value: 'need' },
+        { label: 'Both lists', value: 'both' }
+      ])
   );
 }
 
@@ -493,27 +601,15 @@ client.on('interactionCreate', async interaction => {
         if (albums.length === 0) return interaction.reply({ content: '❌ You have no data to remove.', flags: 64 });
 
         session.type = 'remove';
-        return interaction.reply({
-          content: 'Select album:',
-          components: [removeAlbumMenu(albums)],
-          flags: 64
-        });
+        return interaction.reply({ content: 'Select album:', components: [removeAlbumMenu(albums)], flags: 64 });
       }
 
       if (interaction.commandName === 'list') {
-        return interaction.reply({
-          content: 'Which list do you want to see?',
-          components: [listTypeMenu()],
-          flags: 64
-        });
+        return interaction.reply({ content: 'Which list do you want to see?', components: [listTypeMenu()], flags: 64 });
       }
 
       if (interaction.commandName === 'matches') {
-        return interaction.reply({
-          content: 'Which matches do you want to see?',
-          components: [matchesTypeMenu()],
-          flags: 64
-        });
+        return interaction.reply({ content: 'Which matches do you want to see?', components: [matchesTypeMenu()], flags: 64 });
       }
 
       if (interaction.commandName === 'clear') {
@@ -537,11 +633,79 @@ client.on('interactionCreate', async interaction => {
 
       if (interaction.commandName === 'trade') {
         session.tradeStep = 'selectUser';
-        return interaction.reply({
-          content: '🤝 Who are you trading with?',
-          components: [tradeUserMenu()],
-          flags: 64
-        });
+        return interaction.reply({ content: '🤝 Who are you trading with?', components: [tradeUserMenu()], flags: 64 });
+      }
+
+      // ======================
+      // ADMIN COMMANDS
+      // ======================
+      if (interaction.commandName === 'admin') {
+        if (!isAdmin(interaction.member)) {
+          return interaction.reply({ content: '❌ You do not have permission to use admin commands.', flags: 64 });
+        }
+
+        const sub = interaction.options.getSubcommand();
+
+        // /admin expire
+        if (sub === 'expire') {
+          const guild = servers[interaction.guildId];
+          const now = Date.now();
+          const timeout = 14 * 24 * 60 * 60 * 1000;
+
+          const entries = [];
+          for (const [userId, user] of Object.entries(guild.users || {})) {
+            const lastUpdated = Math.max(user.haveUpdated || 0, user.needUpdated || 0);
+            if (lastUpdated === 0) continue;
+            const msLeft = timeout - (now - lastUpdated);
+            const daysLeft = Math.max(0, Math.ceil(msLeft / (24 * 60 * 60 * 1000)));
+            entries.push({ userId, daysLeft });
+          }
+
+          if (entries.length === 0) {
+            return interaction.reply({ content: '📋 No user data found.', flags: 64 });
+          }
+
+          entries.sort((a, b) => a.daysLeft - b.daysLeft);
+
+          const totalPages = Math.ceil(entries.length / 10);
+          const msg = buildExpirePage(entries, 0);
+          const buttons = expirePageButtons(0, totalPages, interaction.guildId);
+
+          // Store entries in session for pagination
+          session.expireEntries = entries;
+
+          const payload = { content: msg, flags: 64 };
+          if (buttons) payload.components = [buttons];
+          return interaction.reply(payload);
+        }
+
+        // /admin delete
+        if (sub === 'delete') {
+          return interaction.reply({
+            content: '🗑️ Select the user whose data you want to delete:',
+            components: [adminDeleteUserMenu()],
+            flags: 64
+          });
+        }
+
+        // /admin logs
+        if (sub === 'logs') {
+          const logs = await logsCollection.find({ guildId: interaction.guildId }).sort({ timestamp: -1 }).toArray();
+
+          if (logs.length === 0) {
+            return interaction.reply({ content: '📋 No admin deletion logs found.', flags: 64 });
+          }
+
+          const totalPages = Math.ceil(logs.length / 10);
+          const msg = buildLogsPage(logs, 0);
+          const buttons = logsPageButtons(0, totalPages, interaction.guildId);
+
+          session.logsCache = logs;
+
+          const payload = { content: msg, flags: 64 };
+          if (buttons) payload.components = [buttons];
+          return interaction.reply(payload);
+        }
       }
     }
 
@@ -550,6 +714,55 @@ client.on('interactionCreate', async interaction => {
     // ======================
     if (interaction.isStringSelectMenu() || interaction.isUserSelectMenu()) {
       const parts = interaction.customId.split('|');
+
+      // ADMIN DELETE USER SELECT
+      if (interaction.customId === 'adminDeleteUser') {
+        if (!isAdmin(interaction.member)) {
+          return interaction.update({ content: '❌ You do not have permission.', components: [] });
+        }
+        const targetId = interaction.values[0];
+        const targetUser = await client.users.fetch(targetId).catch(() => null);
+        const targetTag = targetUser ? targetUser.tag : targetId;
+
+        return interaction.update({
+          content: `🗑️ Delete data for <@${targetId}>. What do you want to delete?`,
+          components: [adminDeleteTypeMenu(targetId)]
+        });
+      }
+
+      // ADMIN DELETE TYPE SELECT
+      if (parts[0] === 'adminDeleteType') {
+        if (!isAdmin(interaction.member)) {
+          return interaction.update({ content: '❌ You do not have permission.', components: [] });
+        }
+        const targetId = parts[1];
+        const action = interaction.values[0];
+        const user = servers[interaction.guildId]?.users[targetId];
+        const targetUser = await client.users.fetch(targetId).catch(() => null);
+        const targetTag = targetUser ? targetUser.tag : targetId;
+
+        if (!user) {
+          return interaction.update({ content: `❌ <@${targetId}> has no data registered.`, components: [] });
+        }
+
+        if (action === 'have' || action === 'both') user.have = {};
+        if (action === 'need' || action === 'both') user.need = {};
+
+        await saveData();
+        await writeLog(
+          interaction.guildId,
+          interaction.user.id,
+          interaction.user.tag,
+          targetId,
+          targetTag,
+          action
+        );
+
+        return interaction.update({
+          content: `✅ Deleted **${action}** list for <@${targetId}>.\n🪵 This action has been logged.`,
+          components: []
+        });
+      }
 
       // REMOVE ALBUM MENU
       if (interaction.customId === 'removeAlbum') {
@@ -794,12 +1007,8 @@ client.on('interactionCreate', async interaction => {
         const user = servers[interaction.guildId].users[interaction.user.id];
         if (!user) return interaction.update({ content: 'No data to clear.', components: [] });
 
-        if (choice === 'have' || choice === 'need') {
-          user[choice] = {};
-        } else if (choice === 'both') {
-          user.have = {};
-          user.need = {};
-        }
+        if (choice === 'have' || choice === 'need') user[choice] = {};
+        else if (choice === 'both') { user.have = {}; user.need = {}; }
 
         await saveData();
         return interaction.update({ content: `✅ Cleared ${choice}`, components: [] });
@@ -825,7 +1034,6 @@ client.on('interactionCreate', async interaction => {
         const pieces = interaction.values;
 
         await interaction.deferUpdate();
-
         await savePieces(interaction.guildId, interaction.user.id, session.type, album, puzzle, pieces);
 
         if (interaction.channel) {
@@ -845,6 +1053,49 @@ client.on('interactionCreate', async interaction => {
     if (interaction.isButton()) {
       const parts = interaction.customId.split('|');
 
+      // EXPIRE PAGINATION
+      if (parts[0] === 'expirePage') {
+        if (!isAdmin(interaction.member)) {
+          return interaction.reply({ content: '❌ You do not have permission.', flags: 64 });
+        }
+        if (interaction.user.id !== interaction.message.interaction?.user?.id) {
+          return interaction.reply({ content: '❌ This is not your command.', flags: 64 });
+        }
+
+        const page = parseInt(parts[2]);
+        const entries = session.expireEntries || [];
+        const totalPages = Math.ceil(entries.length / 10);
+        const msg = buildExpirePage(entries, page);
+        const buttons = expirePageButtons(page, totalPages, interaction.guildId);
+
+        const payload = { content: msg };
+        if (buttons) payload.components = [buttons];
+        else payload.components = [];
+        return interaction.update(payload);
+      }
+
+      // LOGS PAGINATION
+      if (parts[0] === 'logsPage') {
+        if (!isAdmin(interaction.member)) {
+          return interaction.reply({ content: '❌ You do not have permission.', flags: 64 });
+        }
+        if (interaction.user.id !== interaction.message.interaction?.user?.id) {
+          return interaction.reply({ content: '❌ This is not your command.', flags: 64 });
+        }
+
+        const page = parseInt(parts[2]);
+        const logs = session.logsCache || [];
+        const totalPages = Math.ceil(logs.length / 10);
+        const msg = buildLogsPage(logs, page);
+        const buttons = logsPageButtons(page, totalPages, interaction.guildId);
+
+        const payload = { content: msg };
+        if (buttons) payload.components = [buttons];
+        else payload.components = [];
+        return interaction.update(payload);
+      }
+
+      // TRADE BUTTONS
       if (parts[0] === 'tradeConfirm' || parts[0] === 'tradeDecline') {
         const tradeId = parts[1];
         cleanExpiredTrades();
@@ -912,7 +1163,28 @@ client.once('clientReady', async () => {
     { name: 'list', description: 'See your pieces' },
     { name: 'clear', description: 'Clear your data' },
     { name: 'matches', description: 'See your current matches' },
-    { name: 'trade', description: 'Trade pieces with another user' }
+    { name: 'trade', description: 'Trade pieces with another user' },
+    {
+      name: 'admin',
+      description: 'Admin commands',
+      options: [
+        {
+          name: 'expire',
+          type: 1,
+          description: 'See how long until each user\'s data is deleted'
+        },
+        {
+          name: 'delete',
+          type: 1,
+          description: 'Delete a user\'s have or need list'
+        },
+        {
+          name: 'logs',
+          type: 1,
+          description: 'View admin deletion logs'
+        }
+      ]
+    }
   ]);
 
   setInterval(cleanOldData, 60 * 60 * 1000);
