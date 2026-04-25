@@ -149,7 +149,7 @@ function makePieces(n) {
 }
 
 function isAdmin(member) {
-  return member.permissions.has('ManageGuild');
+  return member.roles.cache.some(role => role.name === 'R4');
 }
 
 // ======================
