@@ -1,4 +1,4 @@
-const { Client, GatewayIntentBits, ActionRowBuilder, StringSelectMenuBuilder } = require('discord.js');
+const { Client, GatewayIntentBits, ActionRowBuilder, StringSelectMenuBuilder, ButtonBuilder, ButtonStyle, UserSelectMenuBuilder } = require('discord.js');
 require('dotenv').config();
 const { MongoClient } = require('mongodb');
 
@@ -10,6 +10,7 @@ const mongoClient = new MongoClient(process.env.MONGO_URI, {
   tlsAllowInvalidCertificates: true,
 });
 let memoryCollection;
+let logsCollection;
 
 async function connectDB() {
   try {
@@ -17,6 +18,7 @@ async function connectDB() {
     console.log("✅ Conectado ao MongoDB!");
     const db = mongoClient.db("puzzleBotDB");
     memoryCollection = db.collection("serversMemory");
+    logsCollection = db.collection("adminLogs");
 
     const saved = await memoryCollection.findOne({ key: 'servers' });
     if (!saved) {
@@ -32,6 +34,30 @@ async function connectDB() {
 }
 
 // ======================
+// 🔄 MIGRATIONS
+// ======================
+async function runMigrations() {
+  let changed = false;
+
+  for (const guild of Object.values(servers)) {
+    for (const user of Object.values(guild.users || {})) {
+      for (const type of ['have', 'need']) {
+        if (user[type]?.BalladOfWindAndCold?.ColdHighways) {
+          user[type].BalladOfWindAndCold.FrostwindTrack = user[type].BalladOfWindAndCold.ColdHighways;
+          delete user[type].BalladOfWindAndCold.ColdHighways;
+          changed = true;
+        }
+      }
+    }
+  }
+
+  if (changed) {
+    await saveData();
+    console.log("✅ Migration complete: ColdHighways → FrostwindTrack");
+  }
+}
+
+// ======================
 // 📦 DISCORD CLIENT
 // ======================
 const client = new Client({
@@ -42,6 +68,7 @@ const client = new Client({
 // 📦 IN-MEMORY DATA
 // ======================
 const servers = {};
+const pendingTrades = {};
 
 // ======================
 // 📚 ALBUMS
@@ -49,7 +76,7 @@ const servers = {};
 const albumsData = {
   BalladOfWindAndCold: {
     HonorAndGlory: 12,
-    ColdHighways: 14,
+    FrostwindTrack: 14,
     WordsOfTheForgotten: 14,
     MonumentToTheFlames: 13,
     AllianceShowdown: 12,
@@ -94,6 +121,23 @@ async function saveData() {
   );
 }
 
+async function writeLog(guildId, adminId, adminTag, targetId, targetTag, action) {
+  if (!logsCollection) return;
+  await logsCollection.insertOne({
+    guildId,
+    adminId,
+    adminTag,
+    targetId,
+    targetTag,
+    action,
+    timestamp: new Date()
+  });
+  // Auto-purge logs older than 60 days
+  const cutoff = new Date();
+  cutoff.setDate(cutoff.getDate() - 60);
+  await logsCollection.deleteMany({ timestamp: { $lt: cutoff } });
+}
+
 function ensureServer(guildId) {
   if (!servers[guildId]) {
     servers[guildId] = { users: {}, sessions: {} };
@@ -102,6 +146,10 @@ function ensureServer(guildId) {
 
 function makePieces(n) {
   return Array.from({ length: n }, (_, i) => (i + 1).toString());
+}
+
+function isAdmin(member) {
+  return member.roles.cache.some(role => role.name === 'R4');
 }
 
 // ======================
@@ -125,6 +173,165 @@ function formatList(typeData) {
   return msg.trim() || null;
 }
 
+function getUserAlbums(userData) {
+  const albums = [];
+  for (const album in albumsData) {
+    const hasHave = Object.keys(userData.have?.[album] || {}).some(
+      puzzle => (userData.have[album][puzzle] || []).length > 0
+    );
+    const hasNeed = Object.keys(userData.need?.[album] || {}).some(
+      puzzle => (userData.need[album][puzzle] || []).length > 0
+    );
+    if (hasHave || hasNeed) albums.push(album);
+  }
+  return albums;
+}
+
+function getUserPuzzles(userData, album) {
+  const puzzles = [];
+  for (const puzzle in albumsData[album]) {
+    const haveCount = (userData.have?.[album]?.[puzzle] || []).length;
+    const needCount = (userData.need?.[album]?.[puzzle] || []).length;
+    if (haveCount > 0 || needCount > 0) puzzles.push(puzzle);
+  }
+  return puzzles;
+}
+
+function getUserPieces(userData, album, puzzle) {
+  const havePieces = (userData.have?.[album]?.[puzzle] || []).map(p => p.piece);
+  const needPieces = (userData.need?.[album]?.[puzzle] || []).map(p => p.piece);
+  return [...new Set([...havePieces, ...needPieces])].sort((a, b) => Number(a) - Number(b));
+}
+
+function getMatchedAlbums(userA, userB) {
+  const matched = [];
+  for (const album in albumsData) {
+    for (const puzzle in albumsData[album]) {
+      const aPieces = (userA.have?.[album]?.[puzzle] || []).map(p => p.piece);
+      const bPieces = (userB.need?.[album]?.[puzzle] || []).map(p => p.piece);
+      const abMatches = aPieces.filter(p => bPieces.includes(p));
+
+      const bPieces2 = (userB.have?.[album]?.[puzzle] || []).map(p => p.piece);
+      const aPieces2 = (userA.need?.[album]?.[puzzle] || []).map(p => p.piece);
+      const baMatches = bPieces2.filter(p => aPieces2.includes(p));
+
+      if ((abMatches.length > 0 || baMatches.length > 0) && !matched.includes(album)) {
+        matched.push(album);
+      }
+    }
+  }
+  return matched;
+}
+
+function getMatchedPuzzles(userA, userB, album) {
+  const matched = [];
+  for (const puzzle in albumsData[album]) {
+    const aPieces = (userA.have?.[album]?.[puzzle] || []).map(p => p.piece);
+    const bPieces = (userB.need?.[album]?.[puzzle] || []).map(p => p.piece);
+    const abMatches = aPieces.filter(p => bPieces.includes(p));
+
+    const bPieces2 = (userB.have?.[album]?.[puzzle] || []).map(p => p.piece);
+    const aPieces2 = (userA.need?.[album]?.[puzzle] || []).map(p => p.piece);
+    const baMatches = bPieces2.filter(p => aPieces2.includes(p));
+
+    if (abMatches.length > 0 || baMatches.length > 0) matched.push(puzzle);
+  }
+  return matched;
+}
+
+function getMatchedPieces(userA, userB, album, puzzle) {
+  const aPieces = (userA.have?.[album]?.[puzzle] || []).map(p => p.piece);
+  const bPieces = (userB.need?.[album]?.[puzzle] || []).map(p => p.piece);
+  const abMatches = aPieces.filter(p => bPieces.includes(p));
+
+  const bPieces2 = (userB.have?.[album]?.[puzzle] || []).map(p => p.piece);
+  const aPieces2 = (userA.need?.[album]?.[puzzle] || []).map(p => p.piece);
+  const baMatches = bPieces2.filter(p => aPieces2.includes(p));
+
+  return [...new Set([...abMatches, ...baMatches])].sort((a, b) => Number(a) - Number(b));
+}
+
+function cleanExpiredTrades() {
+  const now = Date.now();
+  for (const tradeId in pendingTrades) {
+    if (pendingTrades[tradeId].expiresAt < now) {
+      delete pendingTrades[tradeId];
+    }
+  }
+}
+
+// Build expire list text (paginated, 10 per page)
+function buildExpirePage(entries, page) {
+  const perPage = 10;
+  const start = page * perPage;
+  const slice = entries.slice(start, start + perPage);
+  const totalPages = Math.ceil(entries.length / perPage);
+
+  let msg = `📋 **User Data Expiry** (Page ${page + 1}/${totalPages}):\n\n`;
+  for (const e of slice) {
+    const daysLeft = e.daysLeft;
+    const warning = daysLeft <= 3 ? ' ⚠️' : '';
+    msg += `<@${e.userId}> — **${daysLeft}** day(s) until cleanup${warning}\n`;
+  }
+  return msg;
+}
+
+function expirePageButtons(page, totalPages, guildId) {
+  const row = new ActionRowBuilder();
+  if (page > 0) {
+    row.addComponents(
+      new ButtonBuilder()
+        .setCustomId(`expirePage|${guildId}|${page - 1}`)
+        .setLabel('◀ Previous')
+        .setStyle(ButtonStyle.Secondary)
+    );
+  }
+  if (page < totalPages - 1) {
+    row.addComponents(
+      new ButtonBuilder()
+        .setCustomId(`expirePage|${guildId}|${page + 1}`)
+        .setLabel('Next ▶')
+        .setStyle(ButtonStyle.Secondary)
+    );
+  }
+  return row.components.length > 0 ? row : null;
+}
+
+function buildLogsPage(logs, page) {
+  const perPage = 10;
+  const start = page * perPage;
+  const slice = logs.slice(start, start + perPage);
+  const totalPages = Math.ceil(logs.length / perPage);
+
+  let msg = `📋 **Admin Deletion Logs** (Page ${page + 1}/${totalPages}):\n\n`;
+  for (const log of slice) {
+    const date = new Date(log.timestamp).toLocaleString('en-GB', { dateStyle: 'medium', timeStyle: 'short' });
+    msg += `**Admin:** ${log.adminTag}\n**Deleted:** <@${log.targetId}>'s **${log.action}** list\n**When:** ${date}\n\n`;
+  }
+  return msg;
+}
+
+function logsPageButtons(page, totalPages, guildId) {
+  const row = new ActionRowBuilder();
+  if (page > 0) {
+    row.addComponents(
+      new ButtonBuilder()
+        .setCustomId(`logsPage|${guildId}|${page - 1}`)
+        .setLabel('◀ Previous')
+        .setStyle(ButtonStyle.Secondary)
+    );
+  }
+  if (page < totalPages - 1) {
+    row.addComponents(
+      new ButtonBuilder()
+        .setCustomId(`logsPage|${guildId}|${page + 1}`)
+        .setLabel('Next ▶')
+        .setStyle(ButtonStyle.Secondary)
+    );
+  }
+  return row.components.length > 0 ? row : null;
+}
+
 // ======================
 // MENUS
 // ======================
@@ -137,12 +344,30 @@ function albumMenu() {
   );
 }
 
+function removeAlbumMenu(albums) {
+  return new ActionRowBuilder().addComponents(
+    new StringSelectMenuBuilder()
+      .setCustomId('removeAlbum')
+      .setPlaceholder('Select album')
+      .addOptions(albums.map(a => ({ label: a, value: a })))
+  );
+}
+
 function puzzleMenu(album) {
   return new ActionRowBuilder().addComponents(
     new StringSelectMenuBuilder()
       .setCustomId(`puzzle|${album}`)
       .setPlaceholder('Select puzzle')
       .addOptions(Object.keys(albumsData[album]).map(p => ({ label: p, value: p })))
+  );
+}
+
+function removePuzzleMenu(puzzles, album) {
+  return new ActionRowBuilder().addComponents(
+    new StringSelectMenuBuilder()
+      .setCustomId(`removePuzzle|${album}`)
+      .setPlaceholder('Select puzzle')
+      .addOptions(puzzles.map(p => ({ label: p, value: p })))
   );
 }
 
@@ -154,6 +379,17 @@ function piecesMenu(album, puzzle) {
     new StringSelectMenuBuilder()
       .setCustomId(`pieces|${album}|${puzzle}`)
       .setPlaceholder('Select pieces')
+      .setMinValues(1)
+      .setMaxValues(pieces.length)
+      .addOptions(pieces.map(p => ({ label: p, value: p })))
+  );
+}
+
+function removePiecesMenu(pieces, album, puzzle) {
+  return new ActionRowBuilder().addComponents(
+    new StringSelectMenuBuilder()
+      .setCustomId(`removePieces|${album}|${puzzle}`)
+      .setPlaceholder('Select pieces to remove')
       .setMinValues(1)
       .setMaxValues(pieces.length)
       .addOptions(pieces.map(p => ({ label: p, value: p })))
@@ -184,6 +420,77 @@ function matchesTypeMenu() {
   );
 }
 
+function tradeUserMenu() {
+  return new ActionRowBuilder().addComponents(
+    new UserSelectMenuBuilder()
+      .setCustomId('tradeUser')
+      .setPlaceholder('Select the user you are trading with')
+  );
+}
+
+function adminDeleteUserMenu() {
+  return new ActionRowBuilder().addComponents(
+    new UserSelectMenuBuilder()
+      .setCustomId('adminDeleteUser')
+      .setPlaceholder('Select user to delete data for')
+  );
+}
+
+function adminDeleteTypeMenu(targetId) {
+  return new ActionRowBuilder().addComponents(
+    new StringSelectMenuBuilder()
+      .setCustomId(`adminDeleteType|${targetId}`)
+      .setPlaceholder('What to delete?')
+      .addOptions([
+        { label: 'Have list', value: 'have' },
+        { label: 'Need list', value: 'need' },
+        { label: 'Both lists', value: 'both' }
+      ])
+  );
+}
+
+function tradeAlbumMenu(matchedAlbums) {
+  return new ActionRowBuilder().addComponents(
+    new StringSelectMenuBuilder()
+      .setCustomId('tradeAlbum')
+      .setPlaceholder('Select album')
+      .addOptions(matchedAlbums.map(a => ({ label: a, value: a })))
+  );
+}
+
+function tradePuzzleMenu(matchedPuzzles) {
+  return new ActionRowBuilder().addComponents(
+    new StringSelectMenuBuilder()
+      .setCustomId('tradePuzzle')
+      .setPlaceholder('Select puzzle')
+      .addOptions(matchedPuzzles.map(p => ({ label: p, value: p })))
+  );
+}
+
+function tradePiecesMenu(matchedPieces) {
+  return new ActionRowBuilder().addComponents(
+    new StringSelectMenuBuilder()
+      .setCustomId('tradePieces')
+      .setPlaceholder('Select pieces to trade')
+      .setMinValues(1)
+      .setMaxValues(matchedPieces.length)
+      .addOptions(matchedPieces.map(p => ({ label: p, value: p })))
+  );
+}
+
+function tradeConfirmButtons(tradeId) {
+  return new ActionRowBuilder().addComponents(
+    new ButtonBuilder()
+      .setCustomId(`tradeConfirm|${tradeId}`)
+      .setLabel('✅ Confirm Trade')
+      .setStyle(ButtonStyle.Success),
+    new ButtonBuilder()
+      .setCustomId(`tradeDecline|${tradeId}`)
+      .setLabel('❌ Decline Trade')
+      .setStyle(ButtonStyle.Danger)
+  );
+}
+
 // ======================
 // SAVE & REMOVE PIECES
 // ======================
@@ -195,7 +502,6 @@ async function savePieces(guildId, userId, type, album, puzzle, pieces) {
   if (!users[userId][type][album]) users[userId][type][album] = {};
 
   const existing = users[userId][type][album][puzzle] || [];
-
   const existingKept = existing.filter(p => !pieces.includes(p.piece));
   const newPieces = pieces.map(p => ({ piece: p, timestamp: now }));
 
@@ -280,27 +586,30 @@ client.on('interactionCreate', async interaction => {
     // ======================
     if (interaction.isChatInputCommand()) {
 
-      if (interaction.commandName === 'have' || interaction.commandName === 'need' || interaction.commandName === 'remove') {
-        session.type = interaction.commandName === 'remove' ? 'remove' : interaction.commandName;
+      if (interaction.commandName === 'have' || interaction.commandName === 'need') {
+        session.type = interaction.commandName;
         session.album = null;
         session.puzzle = null;
-        return interaction.reply({ content: 'Select album:', components: [albumMenu()], ephemeral: true });
+        return interaction.reply({ content: 'Select album:', components: [albumMenu()], flags: 64 });
+      }
+
+      if (interaction.commandName === 'remove') {
+        const userData = servers[interaction.guildId]?.users[interaction.user.id];
+        if (!userData) return interaction.reply({ content: '❌ You have no data to remove.', flags: 64 });
+
+        const albums = getUserAlbums(userData);
+        if (albums.length === 0) return interaction.reply({ content: '❌ You have no data to remove.', flags: 64 });
+
+        session.type = 'remove';
+        return interaction.reply({ content: 'Select album:', components: [removeAlbumMenu(albums)], flags: 64 });
       }
 
       if (interaction.commandName === 'list') {
-        return interaction.reply({
-          content: 'Which list do you want to see?',
-          components: [listTypeMenu()],
-          ephemeral: true
-        });
+        return interaction.reply({ content: 'Which list do you want to see?', components: [listTypeMenu()], flags: 64 });
       }
 
       if (interaction.commandName === 'matches') {
-        return interaction.reply({
-          content: 'Which matches do you want to see?',
-          components: [matchesTypeMenu()],
-          ephemeral: true
-        });
+        return interaction.reply({ content: 'Which matches do you want to see?', components: [matchesTypeMenu()], flags: 64 });
       }
 
       if (interaction.commandName === 'clear') {
@@ -318,16 +627,286 @@ client.on('interactionCreate', async interaction => {
                 ])
             )
           ],
-          ephemeral: true
+          flags: 64
         });
+      }
+
+      if (interaction.commandName === 'trade') {
+        session.tradeStep = 'selectUser';
+        return interaction.reply({ content: '🤝 Who are you trading with?', components: [tradeUserMenu()], flags: 64 });
+      }
+
+      // ======================
+      // ADMIN COMMANDS
+      // ======================
+      if (interaction.commandName === 'admin') {
+        if (!isAdmin(interaction.member)) {
+          return interaction.reply({ content: '❌ You do not have permission to use admin commands.', flags: 64 });
+        }
+
+        const sub = interaction.options.getSubcommand();
+
+        // /admin expire
+        if (sub === 'expire') {
+          const guild = servers[interaction.guildId];
+          const now = Date.now();
+          const timeout = 14 * 24 * 60 * 60 * 1000;
+
+          const entries = [];
+          for (const [userId, user] of Object.entries(guild.users || {})) {
+            const lastUpdated = Math.max(user.haveUpdated || 0, user.needUpdated || 0);
+            if (lastUpdated === 0) continue;
+            const msLeft = timeout - (now - lastUpdated);
+            const daysLeft = Math.max(0, Math.ceil(msLeft / (24 * 60 * 60 * 1000)));
+            entries.push({ userId, daysLeft });
+          }
+
+          if (entries.length === 0) {
+            return interaction.reply({ content: '📋 No user data found.', flags: 64 });
+          }
+
+          entries.sort((a, b) => a.daysLeft - b.daysLeft);
+
+          const totalPages = Math.ceil(entries.length / 10);
+          const msg = buildExpirePage(entries, 0);
+          const buttons = expirePageButtons(0, totalPages, interaction.guildId);
+
+          // Store entries in session for pagination
+          session.expireEntries = entries;
+
+          const payload = { content: msg, flags: 64 };
+          if (buttons) payload.components = [buttons];
+          return interaction.reply(payload);
+        }
+
+        // /admin delete
+        if (sub === 'delete') {
+          return interaction.reply({
+            content: '🗑️ Select the user whose data you want to delete:',
+            components: [adminDeleteUserMenu()],
+            flags: 64
+          });
+        }
+
+        // /admin logs
+        if (sub === 'logs') {
+          const logs = await logsCollection.find({ guildId: interaction.guildId }).sort({ timestamp: -1 }).toArray();
+
+          if (logs.length === 0) {
+            return interaction.reply({ content: '📋 No admin deletion logs found.', flags: 64 });
+          }
+
+          const totalPages = Math.ceil(logs.length / 10);
+          const msg = buildLogsPage(logs, 0);
+          const buttons = logsPageButtons(0, totalPages, interaction.guildId);
+
+          session.logsCache = logs;
+
+          const payload = { content: msg, flags: 64 };
+          if (buttons) payload.components = [buttons];
+          return interaction.reply(payload);
+        }
       }
     }
 
     // ======================
     // MENUS
     // ======================
-    if (interaction.isStringSelectMenu()) {
+    if (interaction.isStringSelectMenu() || interaction.isUserSelectMenu()) {
       const parts = interaction.customId.split('|');
+
+      // ADMIN DELETE USER SELECT
+      if (interaction.customId === 'adminDeleteUser') {
+        if (!isAdmin(interaction.member)) {
+          return interaction.update({ content: '❌ You do not have permission.', components: [] });
+        }
+        const targetId = interaction.values[0];
+        const targetUser = await client.users.fetch(targetId).catch(() => null);
+        const targetTag = targetUser ? targetUser.tag : targetId;
+
+        return interaction.update({
+          content: `🗑️ Delete data for <@${targetId}>. What do you want to delete?`,
+          components: [adminDeleteTypeMenu(targetId)]
+        });
+      }
+
+      // ADMIN DELETE TYPE SELECT
+      if (parts[0] === 'adminDeleteType') {
+        if (!isAdmin(interaction.member)) {
+          return interaction.update({ content: '❌ You do not have permission.', components: [] });
+        }
+        const targetId = parts[1];
+        const action = interaction.values[0];
+        const user = servers[interaction.guildId]?.users[targetId];
+        const targetUser = await client.users.fetch(targetId).catch(() => null);
+        const targetTag = targetUser ? targetUser.tag : targetId;
+
+        if (!user) {
+          return interaction.update({ content: `❌ <@${targetId}> has no data registered.`, components: [] });
+        }
+
+        if (action === 'have' || action === 'both') user.have = {};
+        if (action === 'need' || action === 'both') user.need = {};
+
+        await saveData();
+        await writeLog(
+          interaction.guildId,
+          interaction.user.id,
+          interaction.user.tag,
+          targetId,
+          targetTag,
+          action
+        );
+
+        return interaction.update({
+          content: `✅ Deleted **${action}** list for <@${targetId}>.\n🪵 This action has been logged.`,
+          components: []
+        });
+      }
+
+      // REMOVE ALBUM MENU
+      if (interaction.customId === 'removeAlbum') {
+        const album = interaction.values[0];
+        const userData = servers[interaction.guildId]?.users[interaction.user.id];
+        const puzzles = getUserPuzzles(userData, album);
+
+        if (puzzles.length === 0) {
+          return interaction.update({ content: '❌ No data in this album.', components: [] });
+        }
+
+        session.removeAlbum = album;
+        return interaction.update({
+          content: `Album: **${album}**\nSelect a puzzle:`,
+          components: [removePuzzleMenu(puzzles, album)]
+        });
+      }
+
+      // REMOVE PUZZLE MENU
+      if (parts[0] === 'removePuzzle') {
+        const album = parts[1];
+        const puzzle = interaction.values[0];
+        const userData = servers[interaction.guildId]?.users[interaction.user.id];
+        const pieces = getUserPieces(userData, album, puzzle);
+
+        if (pieces.length === 0) {
+          return interaction.update({ content: '❌ No pieces in this puzzle.', components: [] });
+        }
+
+        session.removeAlbum = album;
+        session.removePuzzle = puzzle;
+        return interaction.update({
+          content: `Album: **${album}** | Puzzle: **${puzzle}**\nSelect pieces to remove:`,
+          components: [removePiecesMenu(pieces, album, puzzle)]
+        });
+      }
+
+      // REMOVE PIECES MENU
+      if (parts[0] === 'removePieces') {
+        const album = parts[1];
+        const puzzle = parts[2];
+        const pieces = interaction.values;
+
+        await interaction.deferUpdate();
+        await removePieces(interaction.guildId, interaction.user.id, 'have', album, puzzle, pieces);
+        await removePieces(interaction.guildId, interaction.user.id, 'need', album, puzzle, pieces);
+        return interaction.editReply({ content: `✅ Removed pieces **${pieces.join(', ')}** from **${puzzle}**`, components: [] });
+      }
+
+      // TRADE USER SELECT
+      if (interaction.customId === 'tradeUser') {
+        const userBId = interaction.values[0];
+
+        if (userBId === interaction.user.id) {
+          return interaction.update({ content: '❌ You cannot trade with yourself!', components: [] });
+        }
+
+        const users = servers[interaction.guildId].users;
+        const userA = users[interaction.user.id];
+        const userB = users[userBId];
+
+        if (!userA) return interaction.update({ content: '❌ You have no data registered.', components: [] });
+        if (!userB) return interaction.update({ content: '❌ That user has no data registered.', components: [] });
+
+        const matchedAlbums = getMatchedAlbums(userA, userB);
+        if (matchedAlbums.length === 0) {
+          return interaction.update({ content: `❌ You have no matches with <@${userBId}>.`, components: [] });
+        }
+
+        session.tradeUserB = userBId;
+        session.tradeStep = 'selectAlbum';
+
+        return interaction.update({
+          content: `Trading with <@${userBId}>. Select an album:`,
+          components: [tradeAlbumMenu(matchedAlbums)]
+        });
+      }
+
+      // TRADE ALBUM SELECT
+      if (interaction.customId === 'tradeAlbum') {
+        const album = interaction.values[0];
+        const users = servers[interaction.guildId].users;
+        const userA = users[interaction.user.id];
+        const userB = users[session.tradeUserB];
+
+        const matchedPuzzles = getMatchedPuzzles(userA, userB, album);
+        if (matchedPuzzles.length === 0) {
+          return interaction.update({ content: '❌ No matched puzzles in this album.', components: [] });
+        }
+
+        session.tradeAlbum = album;
+        return interaction.update({
+          content: `Album: **${album}**\nSelect a puzzle:`,
+          components: [tradePuzzleMenu(matchedPuzzles)]
+        });
+      }
+
+      // TRADE PUZZLE SELECT
+      if (interaction.customId === 'tradePuzzle') {
+        const puzzle = interaction.values[0];
+        const users = servers[interaction.guildId].users;
+        const userA = users[interaction.user.id];
+        const userB = users[session.tradeUserB];
+
+        const matchedPieces = getMatchedPieces(userA, userB, session.tradeAlbum, puzzle);
+        if (matchedPieces.length === 0) {
+          return interaction.update({ content: '❌ No matched pieces in this puzzle.', components: [] });
+        }
+
+        session.tradePuzzle = puzzle;
+        return interaction.update({
+          content: `Album: **${session.tradeAlbum}** | Puzzle: **${puzzle}**\nSelect the pieces you are trading:`,
+          components: [tradePiecesMenu(matchedPieces)]
+        });
+      }
+
+      // TRADE PIECES SELECT
+      if (interaction.customId === 'tradePieces') {
+        const pieces = interaction.values;
+        const tradeId = `${interaction.user.id}_${session.tradeUserB}_${Date.now()}`;
+        const expiresAt = Date.now() + 15 * 60 * 1000;
+
+        pendingTrades[tradeId] = {
+          guildId: interaction.guildId,
+          userA: interaction.user.id,
+          userB: session.tradeUserB,
+          album: session.tradeAlbum,
+          puzzle: session.tradePuzzle,
+          pieces,
+          expiresAt
+        };
+
+        await interaction.update({
+          content: `⏳ Trade request sent to <@${session.tradeUserB}>!\nWaiting for their confirmation *(15 minutes)*.\n\n**${session.tradeAlbum} → ${session.tradePuzzle}**\nPieces: ${pieces.join(', ')}`,
+          components: []
+        });
+
+        await interaction.channel.send({
+          content: `🤝 <@${session.tradeUserB}>, <@${interaction.user.id}> wants to trade with you!\n\n**${session.tradeAlbum} → ${session.tradePuzzle}**\nPieces: ${pieces.join(', ')}\n\nDo you confirm this trade? *(expires in 15 minutes)*`,
+          components: [tradeConfirmButtons(tradeId)]
+        });
+
+        return;
+      }
 
       // LIST TYPE MENU
       if (interaction.customId === 'listType') {
@@ -350,7 +929,7 @@ client.on('interactionCreate', async interaction => {
 
         await interaction.update({ content: chunks[0], components: [] });
         for (let i = 1; i < chunks.length; i++) {
-          await interaction.followUp({ content: chunks[i], ephemeral: true });
+          await interaction.followUp({ content: chunks[i], flags: 64 });
         }
         return;
       }
@@ -372,8 +951,10 @@ client.on('interactionCreate', async interaction => {
         for (const [otherId, otherData] of Object.entries(users)) {
           if (otherId === userId) continue;
 
-          for (const album in myData[direction] || {}) {
-            for (const puzzle in myData[direction][album]) {
+          for (const album in albumsData) {
+            if (!myData[direction]?.[album]) continue;
+            for (const puzzle in albumsData[album]) {
+              if (!myData[direction][album]?.[puzzle]) continue;
               const myPieces = myData[direction][album][puzzle].map(p => p.piece);
               const theirPieces = (otherData[opposite]?.[album]?.[puzzle] || []).map(p => p.piece);
               const matches = myPieces.filter(p => theirPieces.includes(p));
@@ -415,7 +996,7 @@ client.on('interactionCreate', async interaction => {
 
         await interaction.update({ content: chunks[0], components: [] });
         for (let i = 1; i < chunks.length; i++) {
-          await interaction.followUp({ content: chunks[i], ephemeral: true });
+          await interaction.followUp({ content: chunks[i], flags: 64 });
         }
         return;
       }
@@ -426,12 +1007,8 @@ client.on('interactionCreate', async interaction => {
         const user = servers[interaction.guildId].users[interaction.user.id];
         if (!user) return interaction.update({ content: 'No data to clear.', components: [] });
 
-        if (choice === 'have' || choice === 'need') {
-          user[choice] = {};
-        } else if (choice === 'both') {
-          user.have = {};
-          user.need = {};
-        }
+        if (choice === 'have' || choice === 'need') user[choice] = {};
+        else if (choice === 'both') { user.have = {}; user.need = {}; }
 
         await saveData();
         return interaction.update({ content: `✅ Cleared ${choice}`, components: [] });
@@ -456,21 +1033,106 @@ client.on('interactionCreate', async interaction => {
         const puzzle = parts[2];
         const pieces = interaction.values;
 
-        if (session.type === 'remove') {
-          await removePieces(interaction.guildId, interaction.user.id, 'have', album, puzzle, pieces);
-          await removePieces(interaction.guildId, interaction.user.id, 'need', album, puzzle, pieces);
-          return interaction.update({ content: `✅ Removed pieces from ${puzzle}`, components: [] });
-        } else {
-          await savePieces(interaction.guildId, interaction.user.id, session.type, album, puzzle, pieces);
+        await interaction.deferUpdate();
+        await savePieces(interaction.guildId, interaction.user.id, session.type, album, puzzle, pieces);
 
-          if (interaction.channel) {
-            await interaction.channel.send(
-              `📦 <@${interaction.user.id}> updated their ${session.type} list for ${puzzle}: ${pieces.join(', ')}`
-            );
-          }
+        if (interaction.channel) {
+          await interaction.channel.send(
+            `📦 <@${interaction.user.id}> updated their ${session.type} list for ${puzzle}: ${pieces.join(', ')}`
+          );
+        }
 
-          await checkMatch(interaction.guildId, interaction.user.id, session.type, album, puzzle, interaction.channel);
-          return interaction.update({ content: `✅ Updated ${puzzle}`, components: [] });
+        await checkMatch(interaction.guildId, interaction.user.id, session.type, album, puzzle, interaction.channel);
+        return interaction.editReply({ content: `✅ Updated ${puzzle}`, components: [] });
+      }
+    }
+
+    // ======================
+    // BUTTONS
+    // ======================
+    if (interaction.isButton()) {
+      const parts = interaction.customId.split('|');
+
+      // EXPIRE PAGINATION
+      if (parts[0] === 'expirePage') {
+        if (!isAdmin(interaction.member)) {
+          return interaction.reply({ content: '❌ You do not have permission.', flags: 64 });
+        }
+        if (interaction.user.id !== interaction.message.interaction?.user?.id) {
+          return interaction.reply({ content: '❌ This is not your command.', flags: 64 });
+        }
+
+        const page = parseInt(parts[2]);
+        const entries = session.expireEntries || [];
+        const totalPages = Math.ceil(entries.length / 10);
+        const msg = buildExpirePage(entries, page);
+        const buttons = expirePageButtons(page, totalPages, interaction.guildId);
+
+        const payload = { content: msg };
+        if (buttons) payload.components = [buttons];
+        else payload.components = [];
+        return interaction.update(payload);
+      }
+
+      // LOGS PAGINATION
+      if (parts[0] === 'logsPage') {
+        if (!isAdmin(interaction.member)) {
+          return interaction.reply({ content: '❌ You do not have permission.', flags: 64 });
+        }
+        if (interaction.user.id !== interaction.message.interaction?.user?.id) {
+          return interaction.reply({ content: '❌ This is not your command.', flags: 64 });
+        }
+
+        const page = parseInt(parts[2]);
+        const logs = session.logsCache || [];
+        const totalPages = Math.ceil(logs.length / 10);
+        const msg = buildLogsPage(logs, page);
+        const buttons = logsPageButtons(page, totalPages, interaction.guildId);
+
+        const payload = { content: msg };
+        if (buttons) payload.components = [buttons];
+        else payload.components = [];
+        return interaction.update(payload);
+      }
+
+      // TRADE BUTTONS
+      if (parts[0] === 'tradeConfirm' || parts[0] === 'tradeDecline') {
+        const tradeId = parts[1];
+        cleanExpiredTrades();
+        const trade = pendingTrades[tradeId];
+
+        if (!trade) {
+          return interaction.reply({ content: '❌ This trade has expired or no longer exists.', flags: 64 });
+        }
+        if (interaction.user.id !== trade.userB) {
+          return interaction.reply({ content: '❌ This trade request is not for you.', flags: 64 });
+        }
+
+        if (parts[0] === 'tradeDecline') {
+          delete pendingTrades[tradeId];
+          await interaction.update({
+            content: `❌ <@${trade.userB}> declined the trade with <@${trade.userA}>.\n\n**${trade.album} → ${trade.puzzle}**\nPieces: ${trade.pieces.join(', ')}`,
+            components: []
+          });
+          await interaction.channel.send(`<@${trade.userA}> your trade request was declined by <@${trade.userB}>. ❌`);
+          return;
+        }
+
+        if (parts[0] === 'tradeConfirm') {
+          const { guildId, userA, userB, album, puzzle, pieces } = trade;
+          delete pendingTrades[tradeId];
+
+          await removePieces(guildId, userA, 'have', album, puzzle, pieces);
+          await removePieces(guildId, userA, 'need', album, puzzle, pieces);
+          await removePieces(guildId, userB, 'have', album, puzzle, pieces);
+          await removePieces(guildId, userB, 'need', album, puzzle, pieces);
+
+          await interaction.update({
+            content: `✅ Trade confirmed between <@${userA}> and <@${userB}>!\n\n**${album} → ${puzzle}**\nPieces traded: ${pieces.join(', ')}`,
+            components: []
+          });
+          await interaction.channel.send(`🎉 <@${userA}> <@${userB}> your trade is complete! Pieces **${pieces.join(', ')}** from **${puzzle}** have been removed from both your lists.`);
+          return;
         }
       }
     }
@@ -479,7 +1141,7 @@ client.on('interactionCreate', async interaction => {
     console.error("❌ Erro na interação:", err);
     try {
       if (interaction.replied || interaction.deferred) return;
-      await interaction.reply({ content: '❌ Algo deu errado. Tente novamente.', ephemeral: true });
+      await interaction.reply({ content: '❌ Algo deu errado. Tente novamente.', flags: 64 });
     } catch (_) {}
   }
 });
@@ -489,6 +1151,7 @@ client.on('interactionCreate', async interaction => {
 // ======================
 async function start() {
   await connectDB();
+  await runMigrations();
   await client.login(process.env.TOKEN);
 }
 
@@ -499,7 +1162,29 @@ client.once('clientReady', async () => {
     { name: 'remove', description: 'Remove pieces from your lists' },
     { name: 'list', description: 'See your pieces' },
     { name: 'clear', description: 'Clear your data' },
-    { name: 'matches', description: 'See your current matches' }
+    { name: 'matches', description: 'See your current matches' },
+    { name: 'trade', description: 'Trade pieces with another user' },
+    {
+      name: 'admin',
+      description: 'Admin commands',
+      options: [
+        {
+          name: 'expire',
+          type: 1,
+          description: 'See how long until each user\'s data is deleted'
+        },
+        {
+          name: 'delete',
+          type: 1,
+          description: 'Delete a user\'s have or need list'
+        },
+        {
+          name: 'logs',
+          type: 1,
+          description: 'View admin deletion logs'
+        }
+      ]
+    }
   ]);
 
   setInterval(cleanOldData, 60 * 60 * 1000);
