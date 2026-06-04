@@ -110,6 +110,46 @@ const albumsData = {
 };
 
 // ======================
+// 🏷️ DISPLAY NAMES
+// ======================
+const displayNames = {
+  // Albums
+  BalladOfWindAndCold: 'Ballad of Wind and Cold',
+  KingsOfCombat: 'Kings of Combat',
+  FrostdragonEmpire: 'Frostdragon Empire',
+  // Puzzles
+  HonorAndGlory: 'Honor and Glory',
+  FrostwindTrack: 'Frostwind Track',
+  WordsOfTheForgotten: 'Words of the Forgotten',
+  MonumentToTheFlames: 'Monument to the Flames',
+  AllianceShowdown: 'Alliance Showdown',
+  StateVersusState: 'State Versus State',
+  TheSummitOfBattle: 'The Summit of Battle',
+  CastleOfConflict: 'Castle of Conflict',
+  RemakerOfOrder: 'Remaker of Order',
+  LeagueOfHonor: 'League of Honor',
+  ATournamentOfHeroes: 'A Tournament of Heroes',
+  DuelOfGreatness: 'Duel of Greatness',
+  TheCallisto: 'The Callisto',
+  TheArenaGamers: 'The Arena Gamers',
+  TheHeliosCannon: 'The Helios Cannon',
+  Behemoth: 'Behemoth',
+  TheBellTolls: 'The Bell Tolls',
+  TheDragonicLegend: 'The Dragonic Legend',
+  WingsOfEmpire: 'Wings of Empire',
+  TheDragonicLegion: 'The Dragonic Legion',
+  Rediscovery: 'Rediscovery',
+  FutureVision: 'Future Vision',
+  WarAndWealth: 'War and Wealth',
+  BanquetForAKing: 'Banquet for a King',
+  ATyrantCrowned: 'A Tyrant Crowned'
+};
+
+function dn(key) {
+  return displayNames[key] || key;
+}
+
+// ======================
 // 💾 DATABASE FUNCTIONS
 // ======================
 async function saveData() {
@@ -160,12 +200,12 @@ function formatList(typeData) {
   let msg = '';
   for (const album in albumsData) {
     if (!typeData[album]) continue;
-    msg += `**${album}:**\n`;
+    msg += `**${dn(album)}:**\n`;
     for (const puzzle in albumsData[album]) {
       const pieces = (typeData[album][puzzle] || [])
         .map(p => p.piece)
         .sort((a, b) => Number(a) - Number(b));
-      if (pieces.length > 0) msg += `${puzzle}: ${pieces.join(', ')}\n`;
+      if (pieces.length > 0) msg += `${dn(puzzle)}: ${pieces.join(', ')}\n`;
     }
     msg += '\n';
   }
@@ -382,7 +422,7 @@ function albumMenu() {
     new StringSelectMenuBuilder()
       .setCustomId('album')
       .setPlaceholder('Select album')
-      .addOptions(Object.keys(albumsData).map(a => ({ label: a, value: a })))
+      .addOptions(Object.keys(albumsData).map(a => ({ label: dn(a), value: a })))
   );
 }
 
@@ -391,7 +431,7 @@ function removeAlbumMenu(albums) {
     new StringSelectMenuBuilder()
       .setCustomId('removeAlbum')
       .setPlaceholder('Select album')
-      .addOptions(albums.map(a => ({ label: a, value: a })))
+      .addOptions(albums.map(a => ({ label: dn(a), value: a })))
   );
 }
 
@@ -400,7 +440,7 @@ function puzzleMenu(album) {
     new StringSelectMenuBuilder()
       .setCustomId(`puzzle|${album}`)
       .setPlaceholder('Select puzzle')
-      .addOptions(Object.keys(albumsData[album]).map(p => ({ label: p, value: p })))
+      .addOptions(Object.keys(albumsData[album]).map(p => ({ label: dn(p), value: p })))
   );
 }
 
@@ -409,7 +449,7 @@ function removePuzzleMenu(puzzles, album) {
     new StringSelectMenuBuilder()
       .setCustomId(`removePuzzle|${album}`)
       .setPlaceholder('Select puzzle')
-      .addOptions(puzzles.map(p => ({ label: p, value: p })))
+      .addOptions(puzzles.map(p => ({ label: dn(p), value: p })))
   );
 }
 
@@ -496,7 +536,7 @@ function tradeAlbumMenu(matchedAlbums) {
     new StringSelectMenuBuilder()
       .setCustomId('tradeAlbum')
       .setPlaceholder('Select album')
-      .addOptions(matchedAlbums.map(a => ({ label: a, value: a })))
+      .addOptions(matchedAlbums.map(a => ({ label: dn(a), value: a })))
   );
 }
 
@@ -505,7 +545,7 @@ function tradePuzzleMenu(matchedPuzzles) {
     new StringSelectMenuBuilder()
       .setCustomId('tradePuzzle')
       .setPlaceholder('Select puzzle')
-      .addOptions(matchedPuzzles.map(p => ({ label: p, value: p })))
+      .addOptions(matchedPuzzles.map(p => ({ label: dn(p), value: p })))
   );
 }
 
@@ -581,7 +621,7 @@ async function checkMatch(guildId, userId, type, album, puzzle, channel) {
     const matches = myPieces.filter(p => otherPieces.includes(p));
     if (matches.length > 0 && channel) {
       await channel.send(
-        `🔥 MATCH!\n<@${userId}> (${type}) ↔ <@${otherId}> (${opposite})\nAlbum: ${album}\nPuzzle: ${puzzle}\nPieces: ${matches.join(', ')}`
+        `🔥 MATCH!\n<@${userId}> (${type}) ↔ <@${otherId}> (${opposite})\nAlbum: ${dn(album)}\nPuzzle: ${dn(puzzle)}\nPieces: ${matches.join(', ')}`
       );
     }
   }
@@ -803,7 +843,7 @@ client.on('interactionCreate', async interaction => {
 
         session.removeAlbum = album;
         return interaction.update({
-          content: `Album: **${album}**\nSelect a puzzle:`,
+          content: `Album: **${dn(album)}**\nSelect a puzzle:`,
           components: [removePuzzleMenu(puzzles, album)]
         });
       }
@@ -821,7 +861,7 @@ client.on('interactionCreate', async interaction => {
         session.removeAlbum = album;
         session.removePuzzle = puzzle;
         return interaction.update({
-          content: `Album: **${album}** | Puzzle: **${puzzle}**\nSelect pieces to remove:`,
+          content: `Album: **${dn(album)}** | Puzzle: **${dn(puzzle)}**\nSelect pieces to remove:`,
           components: [removePiecesMenu(pieces, album, puzzle)]
         });
       }
@@ -834,7 +874,7 @@ client.on('interactionCreate', async interaction => {
         await interaction.deferUpdate();
         await removePieces(interaction.guildId, interaction.user.id, 'have', album, puzzle, pieces);
         await removePieces(interaction.guildId, interaction.user.id, 'need', album, puzzle, pieces);
-        return interaction.editReply({ content: `✅ Removed pieces **${pieces.join(', ')}** from **${puzzle}**`, components: [] });
+        return interaction.editReply({ content: `✅ Removed pieces **${pieces.join(', ')}** from **${dn(puzzle)}**`, components: [] });
       }
 
       if (interaction.customId === 'tradeUser') {
@@ -878,7 +918,7 @@ client.on('interactionCreate', async interaction => {
 
         session.tradeAlbum = album;
         return interaction.update({
-          content: `Album: **${album}**\nSelect a puzzle:`,
+          content: `Album: **${dn(album)}**\nSelect a puzzle:`,
           components: [tradePuzzleMenu(matchedPuzzles)]
         });
       }
@@ -896,7 +936,7 @@ client.on('interactionCreate', async interaction => {
 
         session.tradePuzzle = puzzle;
         return interaction.update({
-          content: `Album: **${session.tradeAlbum}** | Puzzle: **${puzzle}**\nSelect the pieces you are trading:`,
+          content: `Album: **${dn(session.tradeAlbum)}** | Puzzle: **${dn(puzzle)}**\nSelect the pieces you are trading:`,
           components: [tradePiecesMenu(matchedPieces)]
         });
       }
@@ -917,12 +957,12 @@ client.on('interactionCreate', async interaction => {
         };
 
         await interaction.update({
-          content: `⏳ Trade request sent to <@${session.tradeUserB}>!\nWaiting for their confirmation *(15 minutes)*.\n\n**${session.tradeAlbum} → ${session.tradePuzzle}**\nPieces: ${pieces.join(', ')}`,
+          content: `⏳ Trade request sent to <@${session.tradeUserB}>!\nWaiting for their confirmation *(15 minutes)*.\n\n**${dn(session.tradeAlbum)} → ${dn(session.tradePuzzle)}**\nPieces: ${pieces.join(', ')}`,
           components: []
         });
 
         await interaction.channel.send({
-          content: `🤝 <@${session.tradeUserB}>, <@${interaction.user.id}> wants to trade with you!\n\n**${session.tradeAlbum} → ${session.tradePuzzle}**\nPieces: ${pieces.join(', ')}\n\nDo you confirm this trade? *(expires in 15 minutes)*`,
+          content: `🤝 <@${session.tradeUserB}>, <@${interaction.user.id}> wants to trade with you!\n\n**${dn(session.tradeAlbum)} → ${dn(session.tradePuzzle)}**\nPieces: ${pieces.join(', ')}\n\nDo you confirm this trade? *(expires in 15 minutes)*`,
           components: [tradeConfirmButtons(tradeId)]
         });
 
@@ -995,11 +1035,11 @@ client.on('interactionCreate', async interaction => {
         let body = `🔥 **${label}:**\n\n`;
         for (const album in albumsData) {
           if (!matchMap[album]) continue;
-          body += `**${album}:**\n`;
+          body += `**${dn(album)}:**\n`;
           for (const puzzle in albumsData[album]) {
             if (!matchMap[album]?.[puzzle]) continue;
             for (const line of matchMap[album][puzzle]) {
-              body += `${puzzle}: ${line}\n`;
+              body += `${dn(puzzle)}: ${line}\n`;
             }
           }
           body += '\n';
@@ -1034,13 +1074,13 @@ client.on('interactionCreate', async interaction => {
 
       if (interaction.customId === 'album') {
         session.album = interaction.values[0];
-        return interaction.update({ content: `Album: ${session.album}`, components: [puzzleMenu(session.album)] });
+        return interaction.update({ content: `Album: **${dn(session.album)}**`, components: [puzzleMenu(session.album)] });
       }
 
       if (parts[0] === 'puzzle') {
         session.album = parts[1];
         session.puzzle = interaction.values[0];
-        return interaction.update({ content: `Puzzle: ${session.puzzle}`, components: [piecesMenu(parts[1], session.puzzle)] });
+        return interaction.update({ content: `Puzzle: **${dn(session.puzzle)}**`, components: [piecesMenu(parts[1], session.puzzle)] });
       }
 
       if (parts[0] === 'pieces') {
@@ -1053,12 +1093,12 @@ client.on('interactionCreate', async interaction => {
 
         if (interaction.channel) {
           await interaction.channel.send(
-            `📦 <@${interaction.user.id}> updated their ${session.type} list for ${puzzle}: ${pieces.join(', ')}`
+            `📦 <@${interaction.user.id}> updated their ${session.type} list for ${dn(puzzle)}: ${pieces.join(', ')}`
           );
         }
 
         await checkMatch(interaction.guildId, interaction.user.id, session.type, album, puzzle, interaction.channel);
-        return interaction.editReply({ content: `✅ Updated ${puzzle}`, components: [] });
+        return interaction.editReply({ content: `✅ Updated **${dn(puzzle)}**`, components: [] });
       }
     }
 
@@ -1123,7 +1163,7 @@ client.on('interactionCreate', async interaction => {
         if (parts[0] === 'tradeDecline') {
           delete pendingTrades[tradeId];
           await interaction.update({
-            content: `❌ <@${trade.userB}> declined the trade with <@${trade.userA}>.\n\n**${trade.album} → ${trade.puzzle}**\nPieces: ${trade.pieces.join(', ')}`,
+            content: `❌ <@${trade.userB}> declined the trade with <@${trade.userA}>.\n\n**${dn(trade.album)} → ${dn(trade.puzzle)}**\nPieces: ${trade.pieces.join(', ')}`,
             components: []
           });
           await interaction.channel.send(`<@${trade.userA}> your trade request was declined by <@${trade.userB}>. ❌`);
@@ -1140,10 +1180,10 @@ client.on('interactionCreate', async interaction => {
           await removePieces(guildId, userB, 'need', album, puzzle, pieces);
 
           await interaction.update({
-            content: `✅ Trade confirmed between <@${userA}> and <@${userB}>!\n\n**${album} → ${puzzle}**\nPieces traded: ${pieces.join(', ')}`,
+            content: `✅ Trade confirmed between <@${userA}> and <@${userB}>!\n\n**${dn(album)} → ${dn(puzzle)}**\nPieces traded: ${pieces.join(', ')}`,
             components: []
           });
-          await interaction.channel.send(`🎉 <@${userA}> <@${userB}> your trade is complete! Pieces **${pieces.join(', ')}** from **${puzzle}** have been removed from both your lists.`);
+          await interaction.channel.send(`🎉 <@${userA}> <@${userB}> your trade is complete! Pieces **${pieces.join(', ')}** from **${dn(puzzle)}** have been removed from both your lists.`);
           return;
         }
       }
