@@ -1,4 +1,4 @@
-const { Client, GatewayIntentBits, ActionRowBuilder, StringSelectMenuBuilder, ButtonBuilder, ButtonStyle, UserSelectMenuBuilder } = require('discord.js');
+const { Client, GatewayIntentBits, ActionRowBuilder, StringSelectMenuBuilder, ButtonBuilder, ButtonStyle, UserSelectMenuBuilder, ModalBuilder, TextInputBuilder, TextInputStyle } = require('discord.js');
 require('dotenv').config();
 const { MongoClient } = require('mongodb');
 
@@ -9,7 +9,8 @@ const mongoClient = new MongoClient(process.env.MONGO_URI, {
   tls: true,
   tlsAllowInvalidCertificates: true,
 });
-let memoryCollection;
+let profilesCollection;   // global user profiles
+let serverLinksCollection; // which profiles are linked to which servers
 let logsCollection;
 
 async function connectDB() {
@@ -17,16 +18,9 @@ async function connectDB() {
     await mongoClient.connect();
     console.log("✅ Conectado ao MongoDB!");
     const db = mongoClient.db("puzzleBotDB");
-    memoryCollection = db.collection("serversMemory");
-    logsCollection = db.collection("adminLogs");
-
-    const saved = await memoryCollection.findOne({ key: 'servers' });
-    if (!saved) {
-      await memoryCollection.insertOne({ key: 'servers', data: {} });
-      console.log("📂 Documento inicial criado no MongoDB");
-    } else {
-      Object.assign(servers, saved.data);
-    }
+    profilesCollection   = db.collection("profiles");
+    serverLinksCollection = db.collection("serverLinks");
+    logsCollection       = db.collection("adminLogs");
   } catch (err) {
     console.error("❌ Erro ao conectar ao MongoDB:", err);
     process.exit(1);
@@ -34,27 +28,75 @@ async function connectDB() {
 }
 
 // ======================
-// 🔄 MIGRATIONS
+// 🔄 MIGRATION (old → new structure)
 // ======================
 async function runMigrations() {
-  let changed = false;
+  // Old structure was stored in "serversMemory" collection
+  const oldCollection = mongoClient.db("puzzleBotDB").collection("serversMemory");
+  const oldDoc = await oldCollection.findOne({ key: 'servers' });
+  if (!oldDoc || !oldDoc.data || Object.keys(oldDoc.data).length === 0) return;
 
-  for (const guild of Object.values(servers)) {
-    for (const user of Object.values(guild.users || {})) {
+  // Check if migration already ran
+  const alreadyMigrated = await profilesCollection.findOne({ _migratedFromLegacy: true });
+  if (alreadyMigrated) return;
+
+  console.log("🔄 Migrating legacy data to new profile structure...");
+  let migratedUsers = 0;
+
+  for (const [guildId, guild] of Object.entries(oldDoc.data)) {
+    for (const [userId, userData] of Object.entries(guild.users || {})) {
+
+      // Migrate ColdHighways → FrostwindTrack while we're at it
       for (const type of ['have', 'need']) {
-        if (user[type]?.BalladOfWindAndCold?.ColdHighways) {
-          user[type].BalladOfWindAndCold.FrostwindTrack = user[type].BalladOfWindAndCold.ColdHighways;
-          delete user[type].BalladOfWindAndCold.ColdHighways;
-          changed = true;
+        if (userData[type]?.BalladOfWindAndCold?.ColdHighways) {
+          userData[type].BalladOfWindAndCold.FrostwindTrack = userData[type].BalladOfWindAndCold.ColdHighways;
+          delete userData[type].BalladOfWindAndCold.ColdHighways;
         }
       }
+
+      const profileName = 'Main';
+      const now = Date.now();
+
+      // Upsert profile
+      await profilesCollection.updateOne(
+        { userId },
+        {
+          $set: {
+            [`profiles.${profileName}.have`]: userData.have || {},
+            [`profiles.${profileName}.need`]: userData.need || {},
+            [`profiles.${profileName}.haveUpdated`]: userData.haveUpdated || now,
+            [`profiles.${profileName}.needUpdated`]: userData.needUpdated || now,
+            [`profiles.${profileName}.lastReminder`]: userData.lastReminder || 0,
+            _migratedFromLegacy: true
+          }
+        },
+        { upsert: true }
+      );
+
+      // Link profile to server
+      await serverLinksCollection.updateOne(
+        { guildId },
+        {
+          $set: {
+            [`members.${userId}.linkedProfiles`]: [profileName],
+            [`members.${userId}.lastUsedProfile`]: profileName
+          }
+        },
+        { upsert: true }
+      );
+
+      migratedUsers++;
     }
   }
 
-  if (changed) {
-    await saveData();
-    console.log("✅ Migration complete: ColdHighways → FrostwindTrack");
-  }
+  // Mark migration done
+  await profilesCollection.updateOne(
+    { _migratedFromLegacy: true },
+    { $set: { _migratedFromLegacy: true } },
+    { upsert: true }
+  );
+
+  console.log(`✅ Migration complete: ${migratedUsers} users migrated with profile "Main"`);
 }
 
 // ======================
@@ -67,7 +109,7 @@ const client = new Client({
 // ======================
 // 📦 IN-MEMORY DATA
 // ======================
-const servers = {};
+const sessions = {}; // { `${guildId}:${userId}`: { ... } }
 const pendingTrades = {};
 
 // ======================
@@ -113,11 +155,9 @@ const albumsData = {
 // 🏷️ DISPLAY NAMES
 // ======================
 const displayNames = {
-  // Albums
   BalladOfWindAndCold: 'Ballad of Wind and Cold',
   KingsOfCombat: 'Kings of Combat',
   FrostdragonEmpire: 'Frostdragon Empire',
-  // Puzzles
   HonorAndGlory: 'Honor and Glory',
   FrostwindTrack: 'Frostwind Track',
   WordsOfTheForgotten: 'Words of the Forgotten',
@@ -145,42 +185,96 @@ const displayNames = {
   ATyrantCrowned: 'A Tyrant Crowned'
 };
 
-function dn(key) {
-  return displayNames[key] || key;
-}
+function dn(key) { return displayNames[key] || key; }
 
 // ======================
-// 💾 DATABASE FUNCTIONS
+// 💾 PROFILE DB FUNCTIONS
 // ======================
-async function saveData() {
-  if (!memoryCollection) return;
-  await memoryCollection.updateOne(
-    { key: 'servers' },
-    { $set: { data: servers } },
+
+function getSession(guildId, userId) {
+  const key = `${guildId}:${userId}`;
+  if (!sessions[key]) sessions[key] = {};
+  return sessions[key];
+}
+
+async function getUserDoc(userId) {
+  return await profilesCollection.findOne({ userId });
+}
+
+async function getServerLink(guildId) {
+  return await serverLinksCollection.findOne({ guildId });
+}
+
+async function getLinkedProfiles(guildId, userId) {
+  const link = await getServerLink(guildId);
+  return link?.members?.[userId]?.linkedProfiles || [];
+}
+
+async function getLastUsedProfile(guildId, userId) {
+  const link = await getServerLink(guildId);
+  return link?.members?.[userId]?.lastUsedProfile || null;
+}
+
+async function setLastUsedProfile(guildId, userId, profileName) {
+  await serverLinksCollection.updateOne(
+    { guildId },
+    { $set: { [`members.${userId}.lastUsedProfile`]: profileName } },
+    { upsert: true }
+  );
+}
+
+async function linkProfileToServer(guildId, userId, profileName) {
+  const link = await getServerLink(guildId);
+  const existing = link?.members?.[userId]?.linkedProfiles || [];
+  if (!existing.includes(profileName)) existing.push(profileName);
+  await serverLinksCollection.updateOne(
+    { guildId },
+    {
+      $set: {
+        [`members.${userId}.linkedProfiles`]: existing,
+        [`members.${userId}.lastUsedProfile`]: profileName
+      }
+    },
+    { upsert: true }
+  );
+}
+
+async function createProfile(userId, profileName) {
+  const now = Date.now();
+  await profilesCollection.updateOne(
+    { userId },
+    {
+      $set: {
+        [`profiles.${profileName}.have`]: {},
+        [`profiles.${profileName}.need`]: {},
+        [`profiles.${profileName}.haveUpdated`]: now,
+        [`profiles.${profileName}.needUpdated`]: now,
+        [`profiles.${profileName}.lastReminder`]: 0,
+      }
+    },
+    { upsert: true }
+  );
+}
+
+async function getProfile(userId, profileName) {
+  const doc = await getUserDoc(userId);
+  return doc?.profiles?.[profileName] || null;
+}
+
+async function saveProfile(userId, profileName, profileData) {
+  await profilesCollection.updateOne(
+    { userId },
+    { $set: { [`profiles.${profileName}`]: profileData } },
     { upsert: true }
   );
 }
 
 async function writeLog(guildId, adminId, adminTag, targetId, targetTag, action) {
   if (!logsCollection) return;
-  await logsCollection.insertOne({
-    guildId,
-    adminId,
-    adminTag,
-    targetId,
-    targetTag,
-    action,
-    timestamp: new Date()
-  });
+  await logsCollection.insertOne({ guildId, adminId, adminTag, targetId, targetTag, action, timestamp: new Date() });
   const cutoff = new Date();
   cutoff.setDate(cutoff.getDate() - 60);
   await logsCollection.deleteMany({ timestamp: { $lt: cutoff } });
-}
-
-function ensureServer(guildId) {
-  if (!servers[guildId]) {
-    servers[guildId] = { users: {}, sessions: {} };
-  }
 }
 
 function makePieces(n) {
@@ -196,15 +290,12 @@ function isAdmin(member) {
 // ======================
 function formatList(typeData) {
   if (!typeData || Object.keys(typeData).length === 0) return null;
-
   let msg = '';
   for (const album in albumsData) {
     if (!typeData[album]) continue;
     msg += `**${dn(album)}:**\n`;
     for (const puzzle in albumsData[album]) {
-      const pieces = (typeData[album][puzzle] || [])
-        .map(p => p.piece)
-        .sort((a, b) => Number(a) - Number(b));
+      const pieces = (typeData[album][puzzle] || []).map(p => p.piece).sort((a, b) => Number(a) - Number(b));
       if (pieces.length > 0) msg += `${dn(puzzle)}: ${pieces.join(', ')}\n`;
     }
     msg += '\n';
@@ -212,49 +303,58 @@ function formatList(typeData) {
   return msg.trim() || null;
 }
 
-function getUserAlbums(userData) {
+function getUserAlbums(profileData) {
   const albums = [];
   for (const album in albumsData) {
-    const hasHave = Object.keys(userData.have?.[album] || {}).some(
-      puzzle => (userData.have[album][puzzle] || []).length > 0
-    );
-    const hasNeed = Object.keys(userData.need?.[album] || {}).some(
-      puzzle => (userData.need[album][puzzle] || []).length > 0
-    );
+    const hasHave = Object.keys(profileData.have?.[album] || {}).some(p => (profileData.have[album][p] || []).length > 0);
+    const hasNeed = Object.keys(profileData.need?.[album] || {}).some(p => (profileData.need[album][p] || []).length > 0);
     if (hasHave || hasNeed) albums.push(album);
   }
   return albums;
 }
 
-function getUserPuzzles(userData, album) {
+function getUserPuzzles(profileData, album) {
   const puzzles = [];
   for (const puzzle in albumsData[album]) {
-    const haveCount = (userData.have?.[album]?.[puzzle] || []).length;
-    const needCount = (userData.need?.[album]?.[puzzle] || []).length;
-    if (haveCount > 0 || needCount > 0) puzzles.push(puzzle);
+    if ((profileData.have?.[album]?.[puzzle] || []).length > 0 || (profileData.need?.[album]?.[puzzle] || []).length > 0) {
+      puzzles.push(puzzle);
+    }
   }
   return puzzles;
 }
 
-function getUserPieces(userData, album, puzzle) {
-  const havePieces = (userData.have?.[album]?.[puzzle] || []).map(p => p.piece);
-  const needPieces = (userData.need?.[album]?.[puzzle] || []).map(p => p.piece);
-  return [...new Set([...havePieces, ...needPieces])].sort((a, b) => Number(a) - Number(b));
+function getUserPieces(profileData, album, puzzle) {
+  const h = (profileData.have?.[album]?.[puzzle] || []).map(p => p.piece);
+  const n = (profileData.need?.[album]?.[puzzle] || []).map(p => p.piece);
+  return [...new Set([...h, ...n])].sort((a, b) => Number(a) - Number(b));
 }
 
-function getMatchedAlbums(userA, userB) {
+// Get all profile data for users in a server (for matching)
+// Returns: [ { userId, profileName, profileData }, ... ]
+async function getAllServerProfiles(guildId) {
+  const link = await getServerLink(guildId);
+  if (!link?.members) return [];
+  const result = [];
+  for (const [userId, memberData] of Object.entries(link.members)) {
+    const userDoc = await getUserDoc(userId);
+    if (!userDoc?.profiles) continue;
+    for (const profileName of (memberData.linkedProfiles || [])) {
+      const profileData = userDoc.profiles[profileName];
+      if (profileData) result.push({ userId, profileName, profileData });
+    }
+  }
+  return result;
+}
+
+function getMatchedAlbums(profileA, profileB) {
   const matched = [];
   for (const album in albumsData) {
     for (const puzzle in albumsData[album]) {
-      const aPieces = (userA.have?.[album]?.[puzzle] || []).map(p => p.piece);
-      const bPieces = (userB.need?.[album]?.[puzzle] || []).map(p => p.piece);
-      const abMatches = aPieces.filter(p => bPieces.includes(p));
-
-      const bPieces2 = (userB.have?.[album]?.[puzzle] || []).map(p => p.piece);
-      const aPieces2 = (userA.need?.[album]?.[puzzle] || []).map(p => p.piece);
-      const baMatches = bPieces2.filter(p => aPieces2.includes(p));
-
-      if ((abMatches.length > 0 || baMatches.length > 0) && !matched.includes(album)) {
+      const aHave = (profileA.have?.[album]?.[puzzle] || []).map(p => p.piece);
+      const bNeed = (profileB.need?.[album]?.[puzzle] || []).map(p => p.piece);
+      const bHave = (profileB.have?.[album]?.[puzzle] || []).map(p => p.piece);
+      const aNeed = (profileA.need?.[album]?.[puzzle] || []).map(p => p.piece);
+      if ((aHave.filter(p => bNeed.includes(p)).length > 0 || bHave.filter(p => aNeed.includes(p)).length > 0) && !matched.includes(album)) {
         matched.push(album);
       }
     }
@@ -262,84 +362,57 @@ function getMatchedAlbums(userA, userB) {
   return matched;
 }
 
-function getMatchedPuzzles(userA, userB, album) {
+function getMatchedPuzzles(profileA, profileB, album) {
   const matched = [];
   for (const puzzle in albumsData[album]) {
-    const aPieces = (userA.have?.[album]?.[puzzle] || []).map(p => p.piece);
-    const bPieces = (userB.need?.[album]?.[puzzle] || []).map(p => p.piece);
-    const abMatches = aPieces.filter(p => bPieces.includes(p));
-
-    const bPieces2 = (userB.have?.[album]?.[puzzle] || []).map(p => p.piece);
-    const aPieces2 = (userA.need?.[album]?.[puzzle] || []).map(p => p.piece);
-    const baMatches = bPieces2.filter(p => aPieces2.includes(p));
-
-    if (abMatches.length > 0 || baMatches.length > 0) matched.push(puzzle);
+    const aHave = (profileA.have?.[album]?.[puzzle] || []).map(p => p.piece);
+    const bNeed = (profileB.need?.[album]?.[puzzle] || []).map(p => p.piece);
+    const bHave = (profileB.have?.[album]?.[puzzle] || []).map(p => p.piece);
+    const aNeed = (profileA.need?.[album]?.[puzzle] || []).map(p => p.piece);
+    if (aHave.filter(p => bNeed.includes(p)).length > 0 || bHave.filter(p => aNeed.includes(p)).length > 0) {
+      matched.push(puzzle);
+    }
   }
   return matched;
 }
 
-function getMatchedPieces(userA, userB, album, puzzle) {
-  const aPieces = (userA.have?.[album]?.[puzzle] || []).map(p => p.piece);
-  const bPieces = (userB.need?.[album]?.[puzzle] || []).map(p => p.piece);
-  const abMatches = aPieces.filter(p => bPieces.includes(p));
-
-  const bPieces2 = (userB.have?.[album]?.[puzzle] || []).map(p => p.piece);
-  const aPieces2 = (userA.need?.[album]?.[puzzle] || []).map(p => p.piece);
-  const baMatches = bPieces2.filter(p => aPieces2.includes(p));
-
-  return [...new Set([...abMatches, ...baMatches])].sort((a, b) => Number(a) - Number(b));
+function getMatchedPieces(profileA, profileB, album, puzzle) {
+  const aHave = (profileA.have?.[album]?.[puzzle] || []).map(p => p.piece);
+  const bNeed = (profileB.need?.[album]?.[puzzle] || []).map(p => p.piece);
+  const bHave = (profileB.have?.[album]?.[puzzle] || []).map(p => p.piece);
+  const aNeed = (profileA.need?.[album]?.[puzzle] || []).map(p => p.piece);
+  return [...new Set([...aHave.filter(p => bNeed.includes(p)), ...bHave.filter(p => aNeed.includes(p))])].sort((a, b) => Number(a) - Number(b));
 }
 
 function cleanExpiredTrades() {
   const now = Date.now();
   for (const tradeId in pendingTrades) {
-    if (pendingTrades[tradeId].expiresAt < now) {
-      delete pendingTrades[tradeId];
-    }
+    if (pendingTrades[tradeId].expiresAt < now) delete pendingTrades[tradeId];
   }
 }
 
 function buildExpirePage(entries, page) {
   const perPage = 10;
-  const start = page * perPage;
-  const slice = entries.slice(start, start + perPage);
+  const slice = entries.slice(page * perPage, (page + 1) * perPage);
   const totalPages = Math.ceil(entries.length / perPage);
-
   let msg = `📋 **User Data Expiry** (Page ${page + 1}/${totalPages}):\n\n`;
   for (const e of slice) {
-    const warning = e.daysLeft <= 3 ? ' ⚠️' : '';
-    msg += `<@${e.userId}> — **${e.daysLeft}** day(s) until cleanup${warning}\n`;
+    msg += `<@${e.userId}> [**${e.profileName}**] — **${e.daysLeft}** day(s) until cleanup${e.daysLeft <= 3 ? ' ⚠️' : ''}\n`;
   }
   return msg;
 }
 
 function expirePageButtons(page, totalPages, guildId) {
   const row = new ActionRowBuilder();
-  if (page > 0) {
-    row.addComponents(
-      new ButtonBuilder()
-        .setCustomId(`expirePage|${guildId}|${page - 1}`)
-        .setLabel('◀ Previous')
-        .setStyle(ButtonStyle.Secondary)
-    );
-  }
-  if (page < totalPages - 1) {
-    row.addComponents(
-      new ButtonBuilder()
-        .setCustomId(`expirePage|${guildId}|${page + 1}`)
-        .setLabel('Next ▶')
-        .setStyle(ButtonStyle.Secondary)
-    );
-  }
+  if (page > 0) row.addComponents(new ButtonBuilder().setCustomId(`expirePage|${guildId}|${page - 1}`).setLabel('◀ Previous').setStyle(ButtonStyle.Secondary));
+  if (page < totalPages - 1) row.addComponents(new ButtonBuilder().setCustomId(`expirePage|${guildId}|${page + 1}`).setLabel('Next ▶').setStyle(ButtonStyle.Secondary));
   return row.components.length > 0 ? row : null;
 }
 
 function buildLogsPage(logs, page) {
   const perPage = 10;
-  const start = page * perPage;
-  const slice = logs.slice(start, start + perPage);
+  const slice = logs.slice(page * perPage, (page + 1) * perPage);
   const totalPages = Math.ceil(logs.length / perPage);
-
   let msg = `📋 **Admin Deletion Logs** (Page ${page + 1}/${totalPages}):\n\n`;
   for (const log of slice) {
     const date = new Date(log.timestamp).toLocaleString('en-GB', { dateStyle: 'medium', timeStyle: 'short' });
@@ -350,22 +423,8 @@ function buildLogsPage(logs, page) {
 
 function logsPageButtons(page, totalPages, guildId) {
   const row = new ActionRowBuilder();
-  if (page > 0) {
-    row.addComponents(
-      new ButtonBuilder()
-        .setCustomId(`logsPage|${guildId}|${page - 1}`)
-        .setLabel('◀ Previous')
-        .setStyle(ButtonStyle.Secondary)
-    );
-  }
-  if (page < totalPages - 1) {
-    row.addComponents(
-      new ButtonBuilder()
-        .setCustomId(`logsPage|${guildId}|${page + 1}`)
-        .setLabel('Next ▶')
-        .setStyle(ButtonStyle.Secondary)
-    );
-  }
+  if (page > 0) row.addComponents(new ButtonBuilder().setCustomId(`logsPage|${guildId}|${page - 1}`).setLabel('◀ Previous').setStyle(ButtonStyle.Secondary));
+  if (page < totalPages - 1) row.addComponents(new ButtonBuilder().setCustomId(`logsPage|${guildId}|${page + 1}`).setLabel('Next ▶').setStyle(ButtonStyle.Secondary));
   return row.components.length > 0 ? row : null;
 }
 
@@ -375,254 +434,36 @@ function logsPageButtons(page, totalPages, guildId) {
 async function sendReminders() {
   const now = Date.now();
   const sevenDays = 7 * 24 * 60 * 60 * 1000;
+  const allLinks = await serverLinksCollection.find({}).toArray();
 
-  for (const [guildId, guild] of Object.entries(servers)) {
-    const discordGuild = await client.guilds.fetch(guildId).catch(() => null);
+  for (const link of allLinks) {
+    const discordGuild = await client.guilds.fetch(link.guildId).catch(() => null);
     if (!discordGuild) continue;
 
-    for (const [userId, user] of Object.entries(guild.users || {})) {
-      const lastUpdated = Math.max(user.haveUpdated || 0, user.needUpdated || 0);
-      if (lastUpdated === 0) continue;
+    for (const [userId, memberData] of Object.entries(link.members || {})) {
+      const userDoc = await getUserDoc(userId);
+      if (!userDoc?.profiles) continue;
 
-      const daysSinceUpdate = (now - lastUpdated) / (24 * 60 * 60 * 1000);
+      for (const profileName of (memberData.linkedProfiles || [])) {
+        const profile = userDoc.profiles[profileName];
+        if (!profile) continue;
+        const lastUpdated = Math.max(profile.haveUpdated || 0, profile.needUpdated || 0);
+        if (lastUpdated === 0) continue;
+        const daysSinceUpdate = (now - lastUpdated) / (24 * 60 * 60 * 1000);
+        if (daysSinceUpdate < 7) continue;
+        const daysSinceReminder = (now - (profile.lastReminder || 0)) / (24 * 60 * 60 * 1000);
+        if (daysSinceReminder < 7) continue;
 
-      // Send reminder every 7 days of inactivity
-      if (daysSinceUpdate >= 7) {
-        const lastReminder = user.lastReminder || 0;
-        const daysSinceReminder = (now - lastReminder) / (24 * 60 * 60 * 1000);
-
-        // Only send if we haven't reminded them in the last 7 days
-        if (daysSinceReminder >= 7) {
-          try {
-            const member = await discordGuild.members.fetch(userId).catch(() => null);
-            if (!member) continue;
-
-            const guildName = discordGuild.name;
-            await member.send(
-              `👋 **Hey there!**\n\nIt's been a while since you last updated your puzzle piece list on **${guildName}**!\n\nDon't forget — your data gets automatically deleted after **14 days** of inactivity. Head over to the server and use \`/have\` or \`/need\` to keep your list up to date so you don't miss any trades! 🧩\n\nSee you there! 😊`
-            );
-
-            user.lastReminder = now;
-          } catch (err) {
-            // User has DMs disabled — skip silently
-          }
-        }
+        try {
+          const member = await discordGuild.members.fetch(userId).catch(() => null);
+          if (!member) continue;
+          await member.send(
+            `👋 **Hey there!**\n\nIt's been a while since you last updated your **${profileName}** puzzle piece list on **${discordGuild.name}**!\n\nDon't forget — your data gets automatically deleted after **14 days** of inactivity. Head over to the server and use \`/have\` or \`/need\` to keep your list up to date so you don't miss any trades! 🧩\n\nSee you there! 😊`
+          );
+          profile.lastReminder = now;
+          await saveProfile(userId, profileName, profile);
+        } catch (_) {}
       }
-    }
-  }
-
-  await saveData();
-}
-
-// ======================
-// MENUS
-// ======================
-function albumMenu() {
-  return new ActionRowBuilder().addComponents(
-    new StringSelectMenuBuilder()
-      .setCustomId('album')
-      .setPlaceholder('Select album')
-      .addOptions(Object.keys(albumsData).map(a => ({ label: dn(a), value: a })))
-  );
-}
-
-function removeAlbumMenu(albums) {
-  return new ActionRowBuilder().addComponents(
-    new StringSelectMenuBuilder()
-      .setCustomId('removeAlbum')
-      .setPlaceholder('Select album')
-      .addOptions(albums.map(a => ({ label: dn(a), value: a })))
-  );
-}
-
-function puzzleMenu(album) {
-  return new ActionRowBuilder().addComponents(
-    new StringSelectMenuBuilder()
-      .setCustomId(`puzzle|${album}`)
-      .setPlaceholder('Select puzzle')
-      .addOptions(Object.keys(albumsData[album]).map(p => ({ label: dn(p), value: p })))
-  );
-}
-
-function removePuzzleMenu(puzzles, album) {
-  return new ActionRowBuilder().addComponents(
-    new StringSelectMenuBuilder()
-      .setCustomId(`removePuzzle|${album}`)
-      .setPlaceholder('Select puzzle')
-      .addOptions(puzzles.map(p => ({ label: dn(p), value: p })))
-  );
-}
-
-function piecesMenu(album, puzzle) {
-  const count = albumsData[album]?.[puzzle];
-  if (!count) return null;
-  const pieces = makePieces(count);
-  return new ActionRowBuilder().addComponents(
-    new StringSelectMenuBuilder()
-      .setCustomId(`pieces|${album}|${puzzle}`)
-      .setPlaceholder('Select pieces')
-      .setMinValues(1)
-      .setMaxValues(pieces.length)
-      .addOptions(pieces.map(p => ({ label: p, value: p })))
-  );
-}
-
-function removePiecesMenu(pieces, album, puzzle) {
-  return new ActionRowBuilder().addComponents(
-    new StringSelectMenuBuilder()
-      .setCustomId(`removePieces|${album}|${puzzle}`)
-      .setPlaceholder('Select pieces to remove')
-      .setMinValues(1)
-      .setMaxValues(pieces.length)
-      .addOptions(pieces.map(p => ({ label: p, value: p })))
-  );
-}
-
-function listTypeMenu() {
-  return new ActionRowBuilder().addComponents(
-    new StringSelectMenuBuilder()
-      .setCustomId('listType')
-      .setPlaceholder('Select list to view')
-      .addOptions([
-        { label: 'Have', value: 'have' },
-        { label: 'Need', value: 'need' }
-      ])
-  );
-}
-
-function matchesTypeMenu() {
-  return new ActionRowBuilder().addComponents(
-    new StringSelectMenuBuilder()
-      .setCustomId('matchesType')
-      .setPlaceholder('Select match direction')
-      .addOptions([
-        { label: 'Pieces I have that others need', value: 'have' },
-        { label: 'Pieces I need that others have', value: 'need' }
-      ])
-  );
-}
-
-function tradeUserMenu() {
-  return new ActionRowBuilder().addComponents(
-    new UserSelectMenuBuilder()
-      .setCustomId('tradeUser')
-      .setPlaceholder('Select the user you are trading with')
-  );
-}
-
-function adminDeleteUserMenu() {
-  return new ActionRowBuilder().addComponents(
-    new UserSelectMenuBuilder()
-      .setCustomId('adminDeleteUser')
-      .setPlaceholder('Select user to delete data for')
-  );
-}
-
-function adminDeleteTypeMenu(targetId) {
-  return new ActionRowBuilder().addComponents(
-    new StringSelectMenuBuilder()
-      .setCustomId(`adminDeleteType|${targetId}`)
-      .setPlaceholder('What to delete?')
-      .addOptions([
-        { label: 'Have list', value: 'have' },
-        { label: 'Need list', value: 'need' },
-        { label: 'Both lists', value: 'both' }
-      ])
-  );
-}
-
-function tradeAlbumMenu(matchedAlbums) {
-  return new ActionRowBuilder().addComponents(
-    new StringSelectMenuBuilder()
-      .setCustomId('tradeAlbum')
-      .setPlaceholder('Select album')
-      .addOptions(matchedAlbums.map(a => ({ label: dn(a), value: a })))
-  );
-}
-
-function tradePuzzleMenu(matchedPuzzles) {
-  return new ActionRowBuilder().addComponents(
-    new StringSelectMenuBuilder()
-      .setCustomId('tradePuzzle')
-      .setPlaceholder('Select puzzle')
-      .addOptions(matchedPuzzles.map(p => ({ label: dn(p), value: p })))
-  );
-}
-
-function tradePiecesMenu(matchedPieces) {
-  return new ActionRowBuilder().addComponents(
-    new StringSelectMenuBuilder()
-      .setCustomId('tradePieces')
-      .setPlaceholder('Select pieces to trade')
-      .setMinValues(1)
-      .setMaxValues(matchedPieces.length)
-      .addOptions(matchedPieces.map(p => ({ label: p, value: p })))
-  );
-}
-
-function tradeConfirmButtons(tradeId) {
-  return new ActionRowBuilder().addComponents(
-    new ButtonBuilder()
-      .setCustomId(`tradeConfirm|${tradeId}`)
-      .setLabel('✅ Confirm Trade')
-      .setStyle(ButtonStyle.Success),
-    new ButtonBuilder()
-      .setCustomId(`tradeDecline|${tradeId}`)
-      .setLabel('❌ Decline Trade')
-      .setStyle(ButtonStyle.Danger)
-  );
-}
-
-// ======================
-// SAVE & REMOVE PIECES
-// ======================
-async function savePieces(guildId, userId, type, album, puzzle, pieces) {
-  const users = servers[guildId].users;
-  const now = Date.now();
-
-  if (!users[userId]) users[userId] = { have: {}, need: {} };
-  if (!users[userId][type][album]) users[userId][type][album] = {};
-
-  const existing = users[userId][type][album][puzzle] || [];
-  const existingKept = existing.filter(p => !pieces.includes(p.piece));
-  const newPieces = pieces.map(p => ({ piece: p, timestamp: now }));
-
-  users[userId][type][album][puzzle] = [...existingKept, ...newPieces];
-  users[userId][`${type}Updated`] = now;
-
-  await saveData();
-}
-
-async function removePieces(guildId, userId, type, album, puzzle, pieces) {
-  const users = servers[guildId].users;
-  if (!users[userId] || !users[userId][type]?.[album]?.[puzzle]) return;
-
-  users[userId][type][album][puzzle] =
-    users[userId][type][album][puzzle].filter(p => !pieces.includes(p.piece));
-
-  if (users[userId][type][album][puzzle].length === 0) {
-    delete users[userId][type][album][puzzle];
-  }
-
-  await saveData();
-}
-
-// ======================
-// MATCH FUNCTION
-// ======================
-async function checkMatch(guildId, userId, type, album, puzzle, channel) {
-  const opposite = type === 'have' ? 'need' : 'have';
-  const users = servers[guildId].users;
-  const myPieces = (users[userId]?.[type]?.[album]?.[puzzle] || []).map(p => p.piece);
-
-  for (const [otherId, data] of Object.entries(users)) {
-    if (otherId === userId) continue;
-    const otherPieces = (data?.[opposite]?.[album]?.[puzzle] || []).map(p => p.piece);
-    const matches = myPieces.filter(p => otherPieces.includes(p));
-    if (matches.length > 0 && channel) {
-      await channel.send(
-        `🔥 MATCH!\n<@${userId}> (${type}) ↔ <@${otherId}> (${opposite})\nAlbum: ${dn(album)}\nPuzzle: ${dn(puzzle)}\nPieces: ${matches.join(', ')}`
-      );
     }
   }
 }
@@ -633,19 +474,257 @@ async function checkMatch(guildId, userId, type, album, puzzle, channel) {
 async function cleanOldData() {
   const now = Date.now();
   const timeout = 14 * 24 * 60 * 60 * 1000;
+  const allUsers = await profilesCollection.find({}).toArray();
 
-  for (const guild of Object.values(servers)) {
-    for (const [userId, user] of Object.entries(guild.users || {})) {
-      ['have', 'need'].forEach(type => {
-        const updated = user[`${type}Updated`] || 0;
+  for (const userDoc of allUsers) {
+    if (!userDoc.profiles) continue;
+    let changed = false;
+    for (const [profileName, profile] of Object.entries(userDoc.profiles)) {
+      if (profileName.startsWith('_')) continue;
+      for (const type of ['have', 'need']) {
+        const updated = profile[`${type}Updated`] || 0;
         if (now - updated > timeout) {
-          user[type] = {};
+          profile[type] = {};
+          changed = true;
         }
+      }
+      if (changed) await saveProfile(userDoc.userId, profileName, profile);
+    }
+  }
+}
+
+// ======================
+// SAVE & REMOVE PIECES
+// ======================
+async function savePieces(userId, profileName, type, album, puzzle, pieces) {
+  const profile = await getProfile(userId, profileName);
+  if (!profile) return;
+  const now = Date.now();
+  if (!profile[type][album]) profile[type][album] = {};
+  const existing = profile[type][album][puzzle] || [];
+  const kept = existing.filter(p => !pieces.includes(p.piece));
+  profile[type][album][puzzle] = [...kept, ...pieces.map(p => ({ piece: p, timestamp: now }))];
+  profile[`${type}Updated`] = now;
+  await saveProfile(userId, profileName, profile);
+}
+
+async function removePiecesFromProfile(userId, profileName, type, album, puzzle, pieces) {
+  const profile = await getProfile(userId, profileName);
+  if (!profile || !profile[type]?.[album]?.[puzzle]) return;
+  profile[type][album][puzzle] = profile[type][album][puzzle].filter(p => !pieces.includes(p.piece));
+  if (profile[type][album][puzzle].length === 0) delete profile[type][album][puzzle];
+  await saveProfile(userId, profileName, profile);
+}
+
+// ======================
+// CHECK MATCH
+// ======================
+async function checkMatch(guildId, userId, profileName, type, album, puzzle, channel) {
+  const opposite = type === 'have' ? 'need' : 'have';
+  const myProfile = await getProfile(userId, profileName);
+  if (!myProfile) return;
+  const myPieces = (myProfile[type]?.[album]?.[puzzle] || []).map(p => p.piece);
+  const allProfiles = await getAllServerProfiles(guildId);
+
+  for (const { userId: otherId, profileName: otherProfileName, profileData: otherProfile } of allProfiles) {
+    if (otherId === userId && otherProfileName === profileName) continue;
+    const otherPieces = (otherProfile[opposite]?.[album]?.[puzzle] || []).map(p => p.piece);
+    const matches = myPieces.filter(p => otherPieces.includes(p));
+    if (matches.length > 0 && channel) {
+      await channel.send(
+        `🔥 MATCH!\n<@${userId}> [${profileName}] (${type}) ↔ <@${otherId}> [${otherProfileName}] (${opposite})\nAlbum: ${dn(album)}\nPuzzle: ${dn(puzzle)}\nPieces: ${matches.join(', ')}`
+      );
+    }
+  }
+}
+
+// ======================
+// MENUS
+// ======================
+function albumMenu() {
+  return new ActionRowBuilder().addComponents(
+    new StringSelectMenuBuilder().setCustomId('album').setPlaceholder('Select album')
+      .addOptions(Object.keys(albumsData).map(a => ({ label: dn(a), value: a })))
+  );
+}
+
+function removeAlbumMenu(albums) {
+  return new ActionRowBuilder().addComponents(
+    new StringSelectMenuBuilder().setCustomId('removeAlbum').setPlaceholder('Select album')
+      .addOptions(albums.map(a => ({ label: dn(a), value: a })))
+  );
+}
+
+function puzzleMenu(album) {
+  return new ActionRowBuilder().addComponents(
+    new StringSelectMenuBuilder().setCustomId(`puzzle|${album}`).setPlaceholder('Select puzzle')
+      .addOptions(Object.keys(albumsData[album]).map(p => ({ label: dn(p), value: p })))
+  );
+}
+
+function removePuzzleMenu(puzzles, album) {
+  return new ActionRowBuilder().addComponents(
+    new StringSelectMenuBuilder().setCustomId(`removePuzzle|${album}`).setPlaceholder('Select puzzle')
+      .addOptions(puzzles.map(p => ({ label: dn(p), value: p })))
+  );
+}
+
+function piecesMenu(album, puzzle) {
+  const count = albumsData[album]?.[puzzle];
+  if (!count) return null;
+  const pieces = makePieces(count);
+  return new ActionRowBuilder().addComponents(
+    new StringSelectMenuBuilder().setCustomId(`pieces|${album}|${puzzle}`).setPlaceholder('Select pieces')
+      .setMinValues(1).setMaxValues(pieces.length).addOptions(pieces.map(p => ({ label: p, value: p })))
+  );
+}
+
+function removePiecesMenu(pieces, album, puzzle) {
+  return new ActionRowBuilder().addComponents(
+    new StringSelectMenuBuilder().setCustomId(`removePieces|${album}|${puzzle}`).setPlaceholder('Select pieces to remove')
+      .setMinValues(1).setMaxValues(pieces.length).addOptions(pieces.map(p => ({ label: p, value: p })))
+  );
+}
+
+function profileSelectMenu(profiles, customId) {
+  return new ActionRowBuilder().addComponents(
+    new StringSelectMenuBuilder().setCustomId(customId).setPlaceholder('Select a profile')
+      .addOptions(profiles.map(p => ({ label: p, value: p })))
+  );
+}
+
+function listTypeMenu() {
+  return new ActionRowBuilder().addComponents(
+    new StringSelectMenuBuilder().setCustomId('listType').setPlaceholder('Select list to view')
+      .addOptions([{ label: 'Have', value: 'have' }, { label: 'Need', value: 'need' }])
+  );
+}
+
+function matchesTypeMenu() {
+  return new ActionRowBuilder().addComponents(
+    new StringSelectMenuBuilder().setCustomId('matchesType').setPlaceholder('Select match direction')
+      .addOptions([
+        { label: 'Pieces I have that others need', value: 'have' },
+        { label: 'Pieces I need that others have', value: 'need' }
+      ])
+  );
+}
+
+function tradeUserMenu() {
+  return new ActionRowBuilder().addComponents(
+    new UserSelectMenuBuilder().setCustomId('tradeUser').setPlaceholder('Select the user you are trading with')
+  );
+}
+
+function tradeAlbumMenu(matchedAlbums) {
+  return new ActionRowBuilder().addComponents(
+    new StringSelectMenuBuilder().setCustomId('tradeAlbum').setPlaceholder('Select album')
+      .addOptions(matchedAlbums.map(a => ({ label: dn(a), value: a })))
+  );
+}
+
+function tradePuzzleMenu(matchedPuzzles) {
+  return new ActionRowBuilder().addComponents(
+    new StringSelectMenuBuilder().setCustomId('tradePuzzle').setPlaceholder('Select puzzle')
+      .addOptions(matchedPuzzles.map(p => ({ label: dn(p), value: p })))
+  );
+}
+
+function tradePiecesMenu(matchedPieces) {
+  return new ActionRowBuilder().addComponents(
+    new StringSelectMenuBuilder().setCustomId('tradePieces').setPlaceholder('Select pieces to trade')
+      .setMinValues(1).setMaxValues(matchedPieces.length).addOptions(matchedPieces.map(p => ({ label: p, value: p })))
+  );
+}
+
+function tradeConfirmButtons(tradeId) {
+  return new ActionRowBuilder().addComponents(
+    new ButtonBuilder().setCustomId(`tradeConfirm|${tradeId}`).setLabel('✅ Confirm Trade').setStyle(ButtonStyle.Success),
+    new ButtonBuilder().setCustomId(`tradeDecline|${tradeId}`).setLabel('❌ Decline Trade').setStyle(ButtonStyle.Danger)
+  );
+}
+
+function adminDeleteUserMenu() {
+  return new ActionRowBuilder().addComponents(
+    new UserSelectMenuBuilder().setCustomId('adminDeleteUser').setPlaceholder('Select user to delete data for')
+  );
+}
+
+function adminDeleteTypeMenu(targetId) {
+  return new ActionRowBuilder().addComponents(
+    new StringSelectMenuBuilder().setCustomId(`adminDeleteType|${targetId}`).setPlaceholder('What to delete?')
+      .addOptions([{ label: 'Have list', value: 'have' }, { label: 'Need list', value: 'need' }, { label: 'Both lists', value: 'both' }])
+  );
+}
+
+// Modal for profile name input
+function profileNameModal(customId, title) {
+  const modal = new ModalBuilder().setCustomId(customId).setTitle(title);
+  const input = new TextInputBuilder().setCustomId('profileName').setLabel('Profile name (e.g. Main570, Farm600)')
+    .setStyle(TextInputStyle.Short).setMinLength(1).setMaxLength(30).setRequired(true);
+  modal.addComponents(new ActionRowBuilder().addComponents(input));
+  return modal;
+}
+
+// ======================
+// ONBOARDING HELPER
+// Returns the active profile for a user in a server, or triggers onboarding
+// ======================
+async function getActiveProfile(interaction, session) {
+  const { guildId, user: { id: userId } } = interaction;
+  const linkedProfiles = await getLinkedProfiles(guildId, userId);
+
+  // No profiles at all — show create modal
+  if (linkedProfiles.length === 0) {
+    const userDoc = await getUserDoc(userId);
+    const allProfiles = Object.keys(userDoc?.profiles || {}).filter(k => !k.startsWith('_'));
+
+    if (allProfiles.length === 0) {
+      // Brand new user — show create modal
+      await interaction.showModal(profileNameModal('onboardCreate', '🧩 Create your first profile'));
+      return null;
+    } else {
+      // Has profiles elsewhere — ask create or import
+      await interaction.reply({
+        content: `👋 Welcome! You have existing profiles. Would you like to **create a new profile** for this server or **import an existing one**?`,
+        components: [
+          new ActionRowBuilder().addComponents(
+            new ButtonBuilder().setCustomId('onboardNew').setLabel('Create New Profile').setStyle(ButtonStyle.Primary),
+            new ButtonBuilder().setCustomId('onboardImport').setLabel('Import Existing Profile').setStyle(ButtonStyle.Secondary)
+          )
+        ],
+        flags: 64
       });
+      return null;
     }
   }
 
-  await saveData();
+  // One profile — use it automatically
+  if (linkedProfiles.length === 1) {
+    session.activeProfile = linkedProfiles[0];
+    await setLastUsedProfile(guildId, userId, linkedProfiles[0]);
+    return linkedProfiles[0];
+  }
+
+  // Multiple profiles — check session memory first
+  if (session.activeProfile && linkedProfiles.includes(session.activeProfile)) {
+    return session.activeProfile;
+  }
+
+  // Check last used
+  const lastUsed = await getLastUsedProfile(guildId, userId);
+  if (lastUsed && linkedProfiles.includes(lastUsed)) {
+    session.activeProfile = lastUsed;
+    return lastUsed;
+  }
+
+  // Ask which profile to use
+  await interaction.reply({
+    content: `Which profile do you want to use?`,
+    components: [profileSelectMenu(linkedProfiles, 'selectActiveProfile')],
+    flags: 64
+  });
+  return null;
 }
 
 // ======================
@@ -655,13 +734,39 @@ client.on('interactionCreate', async interaction => {
   if (!interaction.guildId) return;
 
   try {
-    ensureServer(interaction.guildId);
+    const { guildId, user: { id: userId } } = interaction;
+    const session = getSession(guildId, userId);
 
-    if (!servers[interaction.guildId].sessions[interaction.user.id]) {
-      servers[interaction.guildId].sessions[interaction.user.id] = {};
+    // ======================
+    // MODALS
+    // ======================
+    if (interaction.isModalSubmit()) {
+      const profileName = interaction.fields.getTextInputValue('profileName').trim();
+
+      if (interaction.customId === 'onboardCreate') {
+        await createProfile(userId, profileName);
+        await linkProfileToServer(guildId, userId, profileName);
+        session.activeProfile = profileName;
+
+        // Continue with the pending command
+        if (session.pendingCommand === 'have' || session.pendingCommand === 'need') {
+          session.type = session.pendingCommand;
+          return interaction.reply({ content: `✅ Profile **${profileName}** created!\n\nSelect album:`, components: [albumMenu()], flags: 64 });
+        }
+        return interaction.reply({ content: `✅ Profile **${profileName}** created and linked to this server!`, flags: 64 });
+      }
+
+      if (interaction.customId === 'profileCreateModal') {
+        const userDoc = await getUserDoc(userId);
+        if (userDoc?.profiles?.[profileName]) {
+          return interaction.reply({ content: `❌ A profile named **${profileName}** already exists.`, flags: 64 });
+        }
+        await createProfile(userId, profileName);
+        await linkProfileToServer(guildId, userId, profileName);
+        session.activeProfile = profileName;
+        return interaction.reply({ content: `✅ Profile **${profileName}** created and linked to this server!`, flags: 64 });
+      }
     }
-
-    const session = servers[interaction.guildId].sessions[interaction.user.id];
 
     // ======================
     // CHAT COMMANDS
@@ -669,44 +774,51 @@ client.on('interactionCreate', async interaction => {
     if (interaction.isChatInputCommand()) {
 
       if (interaction.commandName === 'have' || interaction.commandName === 'need') {
+        session.pendingCommand = interaction.commandName;
+        const profileName = await getActiveProfile(interaction, session);
+        if (!profileName) return; // onboarding triggered
         session.type = interaction.commandName;
-        session.album = null;
-        session.puzzle = null;
-        return interaction.reply({ content: 'Select album:', components: [albumMenu()], flags: 64 });
+        return interaction.reply({ content: `📝 Using profile **${profileName}**\n\nSelect album:`, components: [albumMenu()], flags: 64 });
       }
 
       if (interaction.commandName === 'remove') {
-        const userData = servers[interaction.guildId]?.users[interaction.user.id];
-        if (!userData) return interaction.reply({ content: '❌ You have no data to remove.', flags: 64 });
-
-        const albums = getUserAlbums(userData);
+        session.pendingCommand = 'remove';
+        const profileName = await getActiveProfile(interaction, session);
+        if (!profileName) return;
+        const profile = await getProfile(userId, profileName);
+        const albums = getUserAlbums(profile);
         if (albums.length === 0) return interaction.reply({ content: '❌ You have no data to remove.', flags: 64 });
-
         session.type = 'remove';
-        return interaction.reply({ content: 'Select album:', components: [removeAlbumMenu(albums)], flags: 64 });
+        return interaction.reply({ content: `📝 Using profile **${profileName}**\n\nSelect album:`, components: [removeAlbumMenu(albums)], flags: 64 });
       }
 
       if (interaction.commandName === 'list') {
-        return interaction.reply({ content: 'Which list do you want to see?', components: [listTypeMenu()], flags: 64 });
+        session.pendingCommand = 'list';
+        const profileName = await getActiveProfile(interaction, session);
+        if (!profileName) return;
+        session.listProfile = profileName;
+        return interaction.reply({ content: `📝 Using profile **${profileName}**\n\nWhich list do you want to see?`, components: [listTypeMenu()], flags: 64 });
       }
 
       if (interaction.commandName === 'matches') {
-        return interaction.reply({ content: 'Which matches do you want to see?', components: [matchesTypeMenu()], flags: 64 });
+        session.pendingCommand = 'matches';
+        const profileName = await getActiveProfile(interaction, session);
+        if (!profileName) return;
+        session.matchesProfile = profileName;
+        return interaction.reply({ content: `📝 Using profile **${profileName}**\n\nWhich matches do you want to see?`, components: [matchesTypeMenu()], flags: 64 });
       }
 
       if (interaction.commandName === 'clear') {
+        session.pendingCommand = 'clear';
+        const profileName = await getActiveProfile(interaction, session);
+        if (!profileName) return;
+        session.clearProfile = profileName;
         return interaction.reply({
-          content: 'Which list do you want to clear?',
+          content: `📝 Using profile **${profileName}**\n\nWhich list do you want to clear?`,
           components: [
             new ActionRowBuilder().addComponents(
-              new StringSelectMenuBuilder()
-                .setCustomId('clearMenu')
-                .setPlaceholder('Select list to clear')
-                .addOptions([
-                  { label: 'Have', value: 'have' },
-                  { label: 'Need', value: 'need' },
-                  { label: 'Both', value: 'both' }
-                ])
+              new StringSelectMenuBuilder().setCustomId('clearMenu').setPlaceholder('Select list to clear')
+                .addOptions([{ label: 'Have', value: 'have' }, { label: 'Need', value: 'need' }, { label: 'Both', value: 'both' }])
             )
           ],
           flags: 64
@@ -716,6 +828,73 @@ client.on('interactionCreate', async interaction => {
       if (interaction.commandName === 'trade') {
         session.tradeStep = 'selectUser';
         return interaction.reply({ content: '🤝 Who are you trading with?', components: [tradeUserMenu()], flags: 64 });
+      }
+
+      // ======================
+      // PROFILE COMMANDS
+      // ======================
+      if (interaction.commandName === 'profile') {
+        const sub = interaction.options.getSubcommand();
+
+        if (sub === 'create') {
+          await interaction.showModal(profileNameModal('profileCreateModal', '🧩 Create a new profile'));
+          return;
+        }
+
+        if (sub === 'import') {
+          const userDoc = await getUserDoc(userId);
+          const allProfiles = Object.keys(userDoc?.profiles || {}).filter(k => !k.startsWith('_'));
+          const linked = await getLinkedProfiles(guildId, userId);
+          const importable = allProfiles.filter(p => !linked.includes(p));
+          if (importable.length === 0) {
+            return interaction.reply({ content: '❌ You have no profiles available to import. All your profiles are already linked to this server.', flags: 64 });
+          }
+          return interaction.reply({
+            content: 'Which profile do you want to import to this server?',
+            components: [profileSelectMenu(importable, 'importProfile')],
+            flags: 64
+          });
+        }
+
+        if (sub === 'list') {
+          const userDoc = await getUserDoc(userId);
+          const allProfiles = Object.keys(userDoc?.profiles || {}).filter(k => !k.startsWith('_'));
+          if (allProfiles.length === 0) return interaction.reply({ content: '❌ You have no profiles yet.', flags: 64 });
+
+          // Get all server links for this user
+          const allLinks = await serverLinksCollection.find({ [`members.${userId}`]: { $exists: true } }).toArray();
+          let msg = '📋 **Your Profiles:**\n\n';
+          for (const profileName of allProfiles) {
+            const servers = allLinks.filter(l => l.members?.[userId]?.linkedProfiles?.includes(profileName)).map(l => l.guildId);
+            const serverNames = await Promise.all(servers.map(async gid => {
+              const g = await client.guilds.fetch(gid).catch(() => null);
+              return g ? g.name : gid;
+            }));
+            msg += `**${profileName}**${serverNames.length > 0 ? ` — linked to: ${serverNames.join(', ')}` : ' — not linked to any server'}\n`;
+          }
+          return interaction.reply({ content: msg, flags: 64 });
+        }
+
+        if (sub === 'switch') {
+          const linked = await getLinkedProfiles(guildId, userId);
+          if (linked.length <= 1) return interaction.reply({ content: '❌ You only have one profile in this server.', flags: 64 });
+          return interaction.reply({
+            content: 'Which profile do you want to use for your next commands?',
+            components: [profileSelectMenu(linked, 'switchProfile')],
+            flags: 64
+          });
+        }
+
+        if (sub === 'delete') {
+          const userDoc = await getUserDoc(userId);
+          const allProfiles = Object.keys(userDoc?.profiles || {}).filter(k => !k.startsWith('_'));
+          if (allProfiles.length === 0) return interaction.reply({ content: '❌ You have no profiles to delete.', flags: 64 });
+          return interaction.reply({
+            content: '⚠️ Which profile do you want to **permanently delete**? This cannot be undone!',
+            components: [profileSelectMenu(allProfiles, 'deleteProfile')],
+            flags: 64
+          });
+        }
       }
 
       // ======================
@@ -729,56 +908,46 @@ client.on('interactionCreate', async interaction => {
         const sub = interaction.options.getSubcommand();
 
         if (sub === 'expire') {
-          const guild = servers[interaction.guildId];
+          const link = await getServerLink(guildId);
           const now = Date.now();
           const timeout = 14 * 24 * 60 * 60 * 1000;
-
           const entries = [];
-          for (const [userId, user] of Object.entries(guild.users || {})) {
-            const lastUpdated = Math.max(user.haveUpdated || 0, user.needUpdated || 0);
-            if (lastUpdated === 0) continue;
-            const msLeft = timeout - (now - lastUpdated);
-            const daysLeft = Math.max(0, Math.ceil(msLeft / (24 * 60 * 60 * 1000)));
-            entries.push({ userId, daysLeft });
+
+          for (const [uid, memberData] of Object.entries(link?.members || {})) {
+            const userDoc = await getUserDoc(uid);
+            for (const profileName of (memberData.linkedProfiles || [])) {
+              const profile = userDoc?.profiles?.[profileName];
+              if (!profile) continue;
+              const lastUpdated = Math.max(profile.haveUpdated || 0, profile.needUpdated || 0);
+              if (lastUpdated === 0) continue;
+              const msLeft = timeout - (now - lastUpdated);
+              const daysLeft = Math.max(0, Math.ceil(msLeft / (24 * 60 * 60 * 1000)));
+              entries.push({ userId: uid, profileName, daysLeft });
+            }
           }
 
-          if (entries.length === 0) {
-            return interaction.reply({ content: '📋 No user data found.', flags: 64 });
-          }
-
+          if (entries.length === 0) return interaction.reply({ content: '📋 No user data found.', flags: 64 });
           entries.sort((a, b) => a.daysLeft - b.daysLeft);
           session.expireEntries = entries;
-
           const totalPages = Math.ceil(entries.length / 10);
           const msg = buildExpirePage(entries, 0);
-          const buttons = expirePageButtons(0, totalPages, interaction.guildId);
-
+          const buttons = expirePageButtons(0, totalPages, guildId);
           const payload = { content: msg, flags: 64 };
           if (buttons) payload.components = [buttons];
           return interaction.reply(payload);
         }
 
         if (sub === 'delete') {
-          return interaction.reply({
-            content: '🗑️ Select the user whose data you want to delete:',
-            components: [adminDeleteUserMenu()],
-            flags: 64
-          });
+          return interaction.reply({ content: '🗑️ Select the user whose data you want to delete:', components: [adminDeleteUserMenu()], flags: 64 });
         }
 
         if (sub === 'logs') {
-          const logs = await logsCollection.find({ guildId: interaction.guildId }).sort({ timestamp: -1 }).toArray();
-
-          if (logs.length === 0) {
-            return interaction.reply({ content: '📋 No admin deletion logs found.', flags: 64 });
-          }
-
+          const logs = await logsCollection.find({ guildId }).sort({ timestamp: -1 }).toArray();
+          if (logs.length === 0) return interaction.reply({ content: '📋 No admin deletion logs found.', flags: 64 });
           const totalPages = Math.ceil(logs.length / 10);
           const msg = buildLogsPage(logs, 0);
-          const buttons = logsPageButtons(0, totalPages, interaction.guildId);
-
+          const buttons = logsPageButtons(0, totalPages, guildId);
           session.logsCache = logs;
-
           const payload = { content: msg, flags: 64 };
           if (buttons) payload.components = [buttons];
           return interaction.reply(payload);
@@ -792,14 +961,81 @@ client.on('interactionCreate', async interaction => {
     if (interaction.isStringSelectMenu() || interaction.isUserSelectMenu()) {
       const parts = interaction.customId.split('|');
 
-      if (interaction.customId === 'adminDeleteUser') {
-        if (!isAdmin(interaction.member)) {
-          return interaction.update({ content: '❌ You do not have permission.', components: [] });
+      // ONBOARDING — select active profile
+      if (interaction.customId === 'selectActiveProfile') {
+        const profileName = interaction.values[0];
+        session.activeProfile = profileName;
+        await setLastUsedProfile(guildId, userId, profileName);
+        const pendingCmd = session.pendingCommand;
+        if (pendingCmd === 'have' || pendingCmd === 'need') {
+          session.type = pendingCmd;
+          return interaction.update({ content: `📝 Using profile **${profileName}**\n\nSelect album:`, components: [albumMenu()] });
         }
-        const targetId = interaction.values[0];
-        const targetUser = await client.users.fetch(targetId).catch(() => null);
-        const targetTag = targetUser ? targetUser.tag : targetId;
+        if (pendingCmd === 'remove') {
+          const profile = await getProfile(userId, profileName);
+          const albums = getUserAlbums(profile);
+          if (albums.length === 0) return interaction.update({ content: '❌ You have no data to remove.', components: [] });
+          session.type = 'remove';
+          return interaction.update({ content: `📝 Using profile **${profileName}**\n\nSelect album:`, components: [removeAlbumMenu(albums)] });
+        }
+        if (pendingCmd === 'list') {
+          session.listProfile = profileName;
+          return interaction.update({ content: `📝 Using profile **${profileName}**\n\nWhich list do you want to see?`, components: [listTypeMenu()] });
+        }
+        if (pendingCmd === 'matches') {
+          session.matchesProfile = profileName;
+          return interaction.update({ content: `📝 Using profile **${profileName}**\n\nWhich matches do you want to see?`, components: [matchesTypeMenu()] });
+        }
+        if (pendingCmd === 'clear') {
+          session.clearProfile = profileName;
+          return interaction.update({
+            content: `📝 Using profile **${profileName}**\n\nWhich list do you want to clear?`,
+            components: [new ActionRowBuilder().addComponents(
+              new StringSelectMenuBuilder().setCustomId('clearMenu').setPlaceholder('Select list to clear')
+                .addOptions([{ label: 'Have', value: 'have' }, { label: 'Need', value: 'need' }, { label: 'Both', value: 'both' }])
+            )]
+          });
+        }
+        return interaction.update({ content: `✅ Now using profile **${profileName}**`, components: [] });
+      }
 
+      // SWITCH PROFILE
+      if (interaction.customId === 'switchProfile') {
+        const profileName = interaction.values[0];
+        session.activeProfile = profileName;
+        await setLastUsedProfile(guildId, userId, profileName);
+        return interaction.update({ content: `✅ Switched to profile **${profileName}**. Your next commands will use this profile.`, components: [] });
+      }
+
+      // IMPORT PROFILE
+      if (interaction.customId === 'importProfile') {
+        const profileName = interaction.values[0];
+        await linkProfileToServer(guildId, userId, profileName);
+        session.activeProfile = profileName;
+        return interaction.update({ content: `✅ Profile **${profileName}** has been linked to this server and is now active!`, components: [] });
+      }
+
+      // DELETE PROFILE
+      if (interaction.customId === 'deleteProfile') {
+        const profileName = interaction.values[0];
+        await profilesCollection.updateOne({ userId }, { $unset: { [`profiles.${profileName}`]: '' } });
+        // Remove from all server links
+        const allLinks = await serverLinksCollection.find({ [`members.${userId}.linkedProfiles`]: profileName }).toArray();
+        for (const link of allLinks) {
+          const updated = link.members[userId].linkedProfiles.filter(p => p !== profileName);
+          await serverLinksCollection.updateOne(
+            { guildId: link.guildId },
+            { $set: { [`members.${userId}.linkedProfiles`]: updated } }
+          );
+        }
+        if (session.activeProfile === profileName) delete session.activeProfile;
+        return interaction.update({ content: `✅ Profile **${profileName}** has been permanently deleted.`, components: [] });
+      }
+
+      // ADMIN DELETE USER
+      if (interaction.customId === 'adminDeleteUser') {
+        if (!isAdmin(interaction.member)) return interaction.update({ content: '❌ You do not have permission.', components: [] });
+        const targetId = interaction.values[0];
         return interaction.update({
           content: `🗑️ Delete data for <@${targetId}>. What do you want to delete?`,
           components: [adminDeleteTypeMenu(targetId)]
@@ -807,240 +1043,213 @@ client.on('interactionCreate', async interaction => {
       }
 
       if (parts[0] === 'adminDeleteType') {
-        if (!isAdmin(interaction.member)) {
-          return interaction.update({ content: '❌ You do not have permission.', components: [] });
-        }
+        if (!isAdmin(interaction.member)) return interaction.update({ content: '❌ You do not have permission.', components: [] });
         const targetId = parts[1];
         const action = interaction.values[0];
-        const user = servers[interaction.guildId]?.users[targetId];
         const targetUser = await client.users.fetch(targetId).catch(() => null);
         const targetTag = targetUser ? targetUser.tag : targetId;
-
-        if (!user) {
-          return interaction.update({ content: `❌ <@${targetId}> has no data registered.`, components: [] });
+        const linked = await getLinkedProfiles(guildId, targetId);
+        if (linked.length === 0) return interaction.update({ content: `❌ <@${targetId}> has no data in this server.`, components: [] });
+        for (const profileName of linked) {
+          const profile = await getProfile(targetId, profileName);
+          if (!profile) continue;
+          if (action === 'have' || action === 'both') profile.have = {};
+          if (action === 'need' || action === 'both') profile.need = {};
+          await saveProfile(targetId, profileName, profile);
         }
-
-        if (action === 'have' || action === 'both') user.have = {};
-        if (action === 'need' || action === 'both') user.need = {};
-
-        await saveData();
-        await writeLog(interaction.guildId, interaction.user.id, interaction.user.tag, targetId, targetTag, action);
-
-        return interaction.update({
-          content: `✅ Deleted **${action}** list for <@${targetId}>.\n🪵 This action has been logged.`,
-          components: []
-        });
+        await writeLog(guildId, userId, interaction.user.tag, targetId, targetTag, action);
+        return interaction.update({ content: `✅ Deleted **${action}** list for <@${targetId}> across all their profiles in this server.\n🪵 This action has been logged.`, components: [] });
       }
 
+      // REMOVE ALBUM
       if (interaction.customId === 'removeAlbum') {
         const album = interaction.values[0];
-        const userData = servers[interaction.guildId]?.users[interaction.user.id];
-        const puzzles = getUserPuzzles(userData, album);
-
-        if (puzzles.length === 0) {
-          return interaction.update({ content: '❌ No data in this album.', components: [] });
-        }
-
+        const profileName = session.activeProfile;
+        const profile = await getProfile(userId, profileName);
+        const puzzles = getUserPuzzles(profile, album);
+        if (puzzles.length === 0) return interaction.update({ content: '❌ No data in this album.', components: [] });
         session.removeAlbum = album;
-        return interaction.update({
-          content: `Album: **${dn(album)}**\nSelect a puzzle:`,
-          components: [removePuzzleMenu(puzzles, album)]
-        });
+        return interaction.update({ content: `Album: **${dn(album)}**\nSelect a puzzle:`, components: [removePuzzleMenu(puzzles, album)] });
       }
 
       if (parts[0] === 'removePuzzle') {
         const album = parts[1];
         const puzzle = interaction.values[0];
-        const userData = servers[interaction.guildId]?.users[interaction.user.id];
-        const pieces = getUserPieces(userData, album, puzzle);
-
-        if (pieces.length === 0) {
-          return interaction.update({ content: '❌ No pieces in this puzzle.', components: [] });
-        }
-
+        const profileName = session.activeProfile;
+        const profile = await getProfile(userId, profileName);
+        const pieces = getUserPieces(profile, album, puzzle);
+        if (pieces.length === 0) return interaction.update({ content: '❌ No pieces in this puzzle.', components: [] });
         session.removeAlbum = album;
         session.removePuzzle = puzzle;
-        return interaction.update({
-          content: `Album: **${dn(album)}** | Puzzle: **${dn(puzzle)}**\nSelect pieces to remove:`,
-          components: [removePiecesMenu(pieces, album, puzzle)]
-        });
+        return interaction.update({ content: `Album: **${dn(album)}** | Puzzle: **${dn(puzzle)}**\nSelect pieces to remove:`, components: [removePiecesMenu(pieces, album, puzzle)] });
       }
 
       if (parts[0] === 'removePieces') {
         const album = parts[1];
         const puzzle = parts[2];
         const pieces = interaction.values;
-
+        const profileName = session.activeProfile;
         await interaction.deferUpdate();
-        await removePieces(interaction.guildId, interaction.user.id, 'have', album, puzzle, pieces);
-        await removePieces(interaction.guildId, interaction.user.id, 'need', album, puzzle, pieces);
+        await removePiecesFromProfile(userId, profileName, 'have', album, puzzle, pieces);
+        await removePiecesFromProfile(userId, profileName, 'need', album, puzzle, pieces);
         return interaction.editReply({ content: `✅ Removed pieces **${pieces.join(', ')}** from **${dn(puzzle)}**`, components: [] });
       }
 
+      // TRADE USER
       if (interaction.customId === 'tradeUser') {
         const userBId = interaction.values[0];
+        if (userBId === userId) return interaction.update({ content: '❌ You cannot trade with yourself!', components: [] });
 
-        if (userBId === interaction.user.id) {
-          return interaction.update({ content: '❌ You cannot trade with yourself!', components: [] });
+        const myProfileName = session.activeProfile || await getLastUsedProfile(guildId, userId);
+        if (!myProfileName) return interaction.update({ content: '❌ You have no active profile.', components: [] });
+        const myProfile = await getProfile(userId, myProfileName);
+        if (!myProfile) return interaction.update({ content: '❌ You have no data registered.', components: [] });
+
+        // Get all profiles of userB in this server
+        const userBProfiles = await getLinkedProfiles(guildId, userBId);
+        if (userBProfiles.length === 0) return interaction.update({ content: '❌ That user has no data registered in this server.', components: [] });
+
+        // Find all matches across all their profiles
+        let allMatchedAlbums = [];
+        for (const bProfileName of userBProfiles) {
+          const bProfile = await getProfile(userBId, bProfileName);
+          if (!bProfile) continue;
+          const albums = getMatchedAlbums(myProfile, bProfile);
+          allMatchedAlbums = [...new Set([...allMatchedAlbums, ...albums])];
         }
 
-        const users = servers[interaction.guildId].users;
-        const userA = users[interaction.user.id];
-        const userB = users[userBId];
-
-        if (!userA) return interaction.update({ content: '❌ You have no data registered.', components: [] });
-        if (!userB) return interaction.update({ content: '❌ That user has no data registered.', components: [] });
-
-        const matchedAlbums = getMatchedAlbums(userA, userB);
-        if (matchedAlbums.length === 0) {
-          return interaction.update({ content: `❌ You have no matches with <@${userBId}>.`, components: [] });
-        }
+        if (allMatchedAlbums.length === 0) return interaction.update({ content: `❌ You have no matches with <@${userBId}>.`, components: [] });
 
         session.tradeUserB = userBId;
+        session.tradeMyProfile = myProfileName;
         session.tradeStep = 'selectAlbum';
-
-        return interaction.update({
-          content: `Trading with <@${userBId}>. Select an album:`,
-          components: [tradeAlbumMenu(matchedAlbums)]
-        });
+        return interaction.update({ content: `Trading with <@${userBId}>. Select an album:`, components: [tradeAlbumMenu(allMatchedAlbums)] });
       }
 
       if (interaction.customId === 'tradeAlbum') {
         const album = interaction.values[0];
-        const users = servers[interaction.guildId].users;
-        const userA = users[interaction.user.id];
-        const userB = users[session.tradeUserB];
-
-        const matchedPuzzles = getMatchedPuzzles(userA, userB, album);
-        if (matchedPuzzles.length === 0) {
-          return interaction.update({ content: '❌ No matched puzzles in this album.', components: [] });
+        const myProfile = await getProfile(userId, session.tradeMyProfile);
+        const userBProfiles = await getLinkedProfiles(guildId, session.tradeUserB);
+        let allMatchedPuzzles = [];
+        for (const bProfileName of userBProfiles) {
+          const bProfile = await getProfile(session.tradeUserB, bProfileName);
+          if (!bProfile) continue;
+          const puzzles = getMatchedPuzzles(myProfile, bProfile, album);
+          allMatchedPuzzles = [...new Set([...allMatchedPuzzles, ...puzzles])];
         }
-
+        if (allMatchedPuzzles.length === 0) return interaction.update({ content: '❌ No matched puzzles in this album.', components: [] });
         session.tradeAlbum = album;
-        return interaction.update({
-          content: `Album: **${dn(album)}**\nSelect a puzzle:`,
-          components: [tradePuzzleMenu(matchedPuzzles)]
-        });
+        return interaction.update({ content: `Album: **${dn(album)}**\nSelect a puzzle:`, components: [tradePuzzleMenu(allMatchedPuzzles)] });
       }
 
       if (interaction.customId === 'tradePuzzle') {
         const puzzle = interaction.values[0];
-        const users = servers[interaction.guildId].users;
-        const userA = users[interaction.user.id];
-        const userB = users[session.tradeUserB];
-
-        const matchedPieces = getMatchedPieces(userA, userB, session.tradeAlbum, puzzle);
-        if (matchedPieces.length === 0) {
-          return interaction.update({ content: '❌ No matched pieces in this puzzle.', components: [] });
+        const myProfile = await getProfile(userId, session.tradeMyProfile);
+        const userBProfiles = await getLinkedProfiles(guildId, session.tradeUserB);
+        let allMatchedPieces = [];
+        session.tradeBProfileMap = {};
+        for (const bProfileName of userBProfiles) {
+          const bProfile = await getProfile(session.tradeUserB, bProfileName);
+          if (!bProfile) continue;
+          const pieces = getMatchedPieces(myProfile, bProfile, session.tradeAlbum, puzzle);
+          for (const p of pieces) {
+            if (!allMatchedPieces.includes(p)) {
+              allMatchedPieces.push(p);
+              session.tradeBProfileMap[p] = bProfileName;
+            }
+          }
         }
-
+        allMatchedPieces.sort((a, b) => Number(a) - Number(b));
+        if (allMatchedPieces.length === 0) return interaction.update({ content: '❌ No matched pieces in this puzzle.', components: [] });
         session.tradePuzzle = puzzle;
-        return interaction.update({
-          content: `Album: **${dn(session.tradeAlbum)}** | Puzzle: **${dn(puzzle)}**\nSelect the pieces you are trading:`,
-          components: [tradePiecesMenu(matchedPieces)]
-        });
+        return interaction.update({ content: `Album: **${dn(session.tradeAlbum)}** | Puzzle: **${dn(puzzle)}**\nSelect the pieces you are trading:`, components: [tradePiecesMenu(allMatchedPieces)] });
       }
 
       if (interaction.customId === 'tradePieces') {
         const pieces = interaction.values;
-        const tradeId = `${interaction.user.id}_${session.tradeUserB}_${Date.now()}`;
+        const tradeId = `${userId}_${session.tradeUserB}_${Date.now()}`;
         const expiresAt = Date.now() + 15 * 60 * 1000;
-
         pendingTrades[tradeId] = {
-          guildId: interaction.guildId,
-          userA: interaction.user.id,
+          guildId,
+          userA: userId,
+          userAProfile: session.tradeMyProfile,
           userB: session.tradeUserB,
+          userBProfileMap: session.tradeBProfileMap,
           album: session.tradeAlbum,
           puzzle: session.tradePuzzle,
           pieces,
           expiresAt
         };
-
         await interaction.update({
           content: `⏳ Trade request sent to <@${session.tradeUserB}>!\nWaiting for their confirmation *(15 minutes)*.\n\n**${dn(session.tradeAlbum)} → ${dn(session.tradePuzzle)}**\nPieces: ${pieces.join(', ')}`,
           components: []
         });
-
         await interaction.channel.send({
-          content: `🤝 <@${session.tradeUserB}>, <@${interaction.user.id}> wants to trade with you!\n\n**${dn(session.tradeAlbum)} → ${dn(session.tradePuzzle)}**\nPieces: ${pieces.join(', ')}\n\nDo you confirm this trade? *(expires in 15 minutes)*`,
+          content: `🤝 <@${session.tradeUserB}>, <@${userId}> wants to trade with you!\n\n**${dn(session.tradeAlbum)} → ${dn(session.tradePuzzle)}**\nPieces: ${pieces.join(', ')}\n\nDo you confirm this trade? *(expires in 15 minutes)*`,
           components: [tradeConfirmButtons(tradeId)]
         });
-
         return;
       }
 
+      // LIST TYPE
       if (interaction.customId === 'listType') {
         const type = interaction.values[0];
-        const userData = servers[interaction.guildId]?.users[interaction.user.id];
-        const typeData = userData?.[type];
-        const formatted = formatList(typeData);
-
-        if (!formatted) {
-          return interaction.update({ content: `Your **${type}** list is empty.`, components: [] });
-        }
-
+        const profileName = session.listProfile || session.activeProfile;
+        const profile = await getProfile(userId, profileName);
+        const formatted = formatList(profile?.[type]);
+        if (!formatted) return interaction.update({ content: `Your **${type}** list is empty.`, components: [] });
         const chunks = [];
-        let current = `📋 **Your ${type.toUpperCase()} list:**\n\n`;
+        let current = `📋 **Your ${type.toUpperCase()} list** [${profileName}]:\n\n`;
         for (const line of formatted.split('\n')) {
           if (current.length + line.length + 1 > 1900) { chunks.push(current); current = ''; }
           current += line + '\n';
         }
         if (current.trim()) chunks.push(current);
-
         await interaction.update({ content: chunks[0], components: [] });
-        for (let i = 1; i < chunks.length; i++) {
-          await interaction.followUp({ content: chunks[i], flags: 64 });
-        }
+        for (let i = 1; i < chunks.length; i++) await interaction.followUp({ content: chunks[i], flags: 64 });
         return;
       }
 
+      // MATCHES TYPE
       if (interaction.customId === 'matchesType') {
         const direction = interaction.values[0];
         const opposite = direction === 'have' ? 'need' : 'have';
-        const users = servers[interaction.guildId]?.users;
-        const userId = interaction.user.id;
-        const myData = users?.[userId];
+        const myProfileName = session.matchesProfile || session.activeProfile;
+        const myProfile = await getProfile(userId, myProfileName);
+        if (!myProfile) return interaction.update({ content: 'You have no data.', components: [] });
 
-        if (!myData) {
-          return interaction.update({ content: 'You have no data.', components: [] });
-        }
-
+        const allServerProfiles = await getAllServerProfiles(guildId);
         const matchMap = {};
 
-        for (const [otherId, otherData] of Object.entries(users)) {
-          if (otherId === userId) continue;
-
+        for (const { userId: otherId, profileName: otherProfileName, profileData: otherProfile } of allServerProfiles) {
+          if (otherId === userId && otherProfileName === myProfileName) continue;
           for (const album in albumsData) {
-            if (!myData[direction]?.[album]) continue;
+            if (!myProfile[direction]?.[album]) continue;
             for (const puzzle in albumsData[album]) {
-              if (!myData[direction][album]?.[puzzle]) continue;
-              const myPieces = myData[direction][album][puzzle].map(p => p.piece);
-              const theirPieces = (otherData[opposite]?.[album]?.[puzzle] || []).map(p => p.piece);
+              if (!myProfile[direction][album]?.[puzzle]) continue;
+              const myPieces = myProfile[direction][album][puzzle].map(p => p.piece);
+              const theirPieces = (otherProfile[opposite]?.[album]?.[puzzle] || []).map(p => p.piece);
               const matches = myPieces.filter(p => theirPieces.includes(p));
               if (matches.length > 0) {
                 if (!matchMap[album]) matchMap[album] = {};
                 if (!matchMap[album][puzzle]) matchMap[album][puzzle] = [];
                 const verb = direction === 'have' ? 'needs it' : 'has it';
-                matchMap[album][puzzle].push(`${matches.sort((a, b) => Number(a) - Number(b)).join(', ')} — <@${otherId}> ${verb}`);
+                matchMap[album][puzzle].push(`${matches.sort((a, b) => Number(a) - Number(b)).join(', ')} — <@${otherId}> [${otherProfileName}] ${verb}`);
               }
             }
           }
         }
 
-        if (Object.keys(matchMap).length === 0) {
-          return interaction.update({ content: 'No current matches found.', components: [] });
-        }
+        if (Object.keys(matchMap).length === 0) return interaction.update({ content: 'No current matches found.', components: [] });
 
         const label = direction === 'have' ? 'Pieces I HAVE that others need' : 'Pieces I NEED that others have';
-        let body = `🔥 **${label}:**\n\n`;
+        let body = `🔥 **${label}** [${myProfileName}]:\n\n`;
         for (const album in albumsData) {
           if (!matchMap[album]) continue;
           body += `**${dn(album)}:**\n`;
           for (const puzzle in albumsData[album]) {
             if (!matchMap[album]?.[puzzle]) continue;
-            for (const line of matchMap[album][puzzle]) {
-              body += `${dn(puzzle)}: ${line}\n`;
-            }
+            for (const line of matchMap[album][puzzle]) body += `${dn(puzzle)}: ${line}\n`;
           }
           body += '\n';
         }
@@ -1052,52 +1261,48 @@ client.on('interactionCreate', async interaction => {
           current += line + '\n';
         }
         if (current.trim()) chunks.push(current);
-
         await interaction.update({ content: chunks[0], components: [] });
-        for (let i = 1; i < chunks.length; i++) {
-          await interaction.followUp({ content: chunks[i], flags: 64 });
-        }
+        for (let i = 1; i < chunks.length; i++) await interaction.followUp({ content: chunks[i], flags: 64 });
         return;
       }
 
+      // CLEAR MENU
       if (interaction.customId === 'clearMenu') {
         const choice = interaction.values[0];
-        const user = servers[interaction.guildId].users[interaction.user.id];
-        if (!user) return interaction.update({ content: 'No data to clear.', components: [] });
-
-        if (choice === 'have' || choice === 'need') user[choice] = {};
-        else if (choice === 'both') { user.have = {}; user.need = {}; }
-
-        await saveData();
-        return interaction.update({ content: `✅ Cleared ${choice}`, components: [] });
+        const profileName = session.clearProfile || session.activeProfile;
+        const profile = await getProfile(userId, profileName);
+        if (!profile) return interaction.update({ content: 'No data to clear.', components: [] });
+        if (choice === 'have' || choice === 'both') profile.have = {};
+        if (choice === 'need' || choice === 'both') profile.need = {};
+        await saveProfile(userId, profileName, profile);
+        return interaction.update({ content: `✅ Cleared **${choice}** for profile **${profileName}**`, components: [] });
       }
 
+      // ALBUM MENU
       if (interaction.customId === 'album') {
         session.album = interaction.values[0];
         return interaction.update({ content: `Album: **${dn(session.album)}**`, components: [puzzleMenu(session.album)] });
       }
 
+      // PUZZLE MENU
       if (parts[0] === 'puzzle') {
         session.album = parts[1];
         session.puzzle = interaction.values[0];
         return interaction.update({ content: `Puzzle: **${dn(session.puzzle)}**`, components: [piecesMenu(parts[1], session.puzzle)] });
       }
 
+      // PIECES MENU
       if (parts[0] === 'pieces') {
         const album = parts[1];
         const puzzle = parts[2];
         const pieces = interaction.values;
-
+        const profileName = session.activeProfile;
         await interaction.deferUpdate();
-        await savePieces(interaction.guildId, interaction.user.id, session.type, album, puzzle, pieces);
-
+        await savePieces(userId, profileName, session.type, album, puzzle, pieces);
         if (interaction.channel) {
-          await interaction.channel.send(
-            `📦 <@${interaction.user.id}> updated their ${session.type} list for ${dn(puzzle)}: ${pieces.join(', ')}`
-          );
+          await interaction.channel.send(`📦 <@${userId}> [${profileName}] updated their ${session.type} list for ${dn(puzzle)}: ${pieces.join(', ')}`);
         }
-
-        await checkMatch(interaction.guildId, interaction.user.id, session.type, album, puzzle, interaction.channel);
+        await checkMatch(guildId, userId, profileName, session.type, album, puzzle, interaction.channel);
         return interaction.editReply({ content: `✅ Updated **${dn(puzzle)}**`, components: [] });
       }
     }
@@ -1108,81 +1313,83 @@ client.on('interactionCreate', async interaction => {
     if (interaction.isButton()) {
       const parts = interaction.customId.split('|');
 
-      if (parts[0] === 'expirePage') {
-        if (!isAdmin(interaction.member)) {
-          return interaction.reply({ content: '❌ You do not have permission.', flags: 64 });
-        }
-        if (interaction.user.id !== interaction.message.interaction?.user?.id) {
-          return interaction.reply({ content: '❌ This is not your command.', flags: 64 });
-        }
+      // ONBOARD NEW
+      if (interaction.customId === 'onboardNew') {
+        await interaction.showModal(profileNameModal('onboardCreate', '🧩 Create your profile'));
+        return;
+      }
 
+      // ONBOARD IMPORT
+      if (interaction.customId === 'onboardImport') {
+        const userDoc = await getUserDoc(userId);
+        const allProfiles = Object.keys(userDoc?.profiles || {}).filter(k => !k.startsWith('_'));
+        return interaction.update({
+          content: 'Which profile do you want to import?',
+          components: [profileSelectMenu(allProfiles, 'importProfile')]
+        });
+      }
+
+      // EXPIRE PAGINATION
+      if (parts[0] === 'expirePage') {
+        if (!isAdmin(interaction.member)) return interaction.reply({ content: '❌ You do not have permission.', flags: 64 });
+        if (interaction.user.id !== interaction.message.interaction?.user?.id) return interaction.reply({ content: '❌ This is not your command.', flags: 64 });
         const page = parseInt(parts[2]);
         const entries = session.expireEntries || [];
         const totalPages = Math.ceil(entries.length / 10);
         const msg = buildExpirePage(entries, page);
-        const buttons = expirePageButtons(page, totalPages, interaction.guildId);
-
+        const buttons = expirePageButtons(page, totalPages, guildId);
         const payload = { content: msg };
-        if (buttons) payload.components = [buttons];
-        else payload.components = [];
+        if (buttons) payload.components = [buttons]; else payload.components = [];
         return interaction.update(payload);
       }
 
+      // LOGS PAGINATION
       if (parts[0] === 'logsPage') {
-        if (!isAdmin(interaction.member)) {
-          return interaction.reply({ content: '❌ You do not have permission.', flags: 64 });
-        }
-        if (interaction.user.id !== interaction.message.interaction?.user?.id) {
-          return interaction.reply({ content: '❌ This is not your command.', flags: 64 });
-        }
-
+        if (!isAdmin(interaction.member)) return interaction.reply({ content: '❌ You do not have permission.', flags: 64 });
+        if (interaction.user.id !== interaction.message.interaction?.user?.id) return interaction.reply({ content: '❌ This is not your command.', flags: 64 });
         const page = parseInt(parts[2]);
         const logs = session.logsCache || [];
         const totalPages = Math.ceil(logs.length / 10);
         const msg = buildLogsPage(logs, page);
-        const buttons = logsPageButtons(page, totalPages, interaction.guildId);
-
+        const buttons = logsPageButtons(page, totalPages, guildId);
         const payload = { content: msg };
-        if (buttons) payload.components = [buttons];
-        else payload.components = [];
+        if (buttons) payload.components = [buttons]; else payload.components = [];
         return interaction.update(payload);
       }
 
+      // TRADE BUTTONS
       if (parts[0] === 'tradeConfirm' || parts[0] === 'tradeDecline') {
         const tradeId = parts[1];
         cleanExpiredTrades();
         const trade = pendingTrades[tradeId];
-
-        if (!trade) {
-          return interaction.reply({ content: '❌ This trade has expired or no longer exists.', flags: 64 });
-        }
-        if (interaction.user.id !== trade.userB) {
-          return interaction.reply({ content: '❌ This trade request is not for you.', flags: 64 });
-        }
+        if (!trade) return interaction.reply({ content: '❌ This trade has expired or no longer exists.', flags: 64 });
+        if (interaction.user.id !== trade.userB) return interaction.reply({ content: '❌ This trade request is not for you.', flags: 64 });
 
         if (parts[0] === 'tradeDecline') {
           delete pendingTrades[tradeId];
-          await interaction.update({
-            content: `❌ <@${trade.userB}> declined the trade with <@${trade.userA}>.\n\n**${dn(trade.album)} → ${dn(trade.puzzle)}**\nPieces: ${trade.pieces.join(', ')}`,
-            components: []
-          });
+          await interaction.update({ content: `❌ <@${trade.userB}> declined the trade with <@${trade.userA}>.\n\n**${dn(trade.album)} → ${dn(trade.puzzle)}**\nPieces: ${trade.pieces.join(', ')}`, components: [] });
           await interaction.channel.send(`<@${trade.userA}> your trade request was declined by <@${trade.userB}>. ❌`);
           return;
         }
 
         if (parts[0] === 'tradeConfirm') {
-          const { guildId, userA, userB, album, puzzle, pieces } = trade;
+          const { guildId: tGuildId, userA, userAProfile, userB, userBProfileMap, album, puzzle, pieces } = trade;
           delete pendingTrades[tradeId];
-
-          await removePieces(guildId, userA, 'have', album, puzzle, pieces);
-          await removePieces(guildId, userA, 'need', album, puzzle, pieces);
-          await removePieces(guildId, userB, 'have', album, puzzle, pieces);
-          await removePieces(guildId, userB, 'need', album, puzzle, pieces);
-
-          await interaction.update({
-            content: `✅ Trade confirmed between <@${userA}> and <@${userB}>!\n\n**${dn(album)} → ${dn(puzzle)}**\nPieces traded: ${pieces.join(', ')}`,
-            components: []
-          });
+          // Remove from userA's profile
+          await removePiecesFromProfile(userA, userAProfile, 'have', album, puzzle, pieces);
+          await removePiecesFromProfile(userA, userAProfile, 'need', album, puzzle, pieces);
+          // Remove from userB's profiles (each piece mapped to its profile)
+          const bPiecesByProfile = {};
+          for (const piece of pieces) {
+            const bProfile = userBProfileMap[piece] || (await getLinkedProfiles(tGuildId, userB))[0];
+            if (!bPiecesByProfile[bProfile]) bPiecesByProfile[bProfile] = [];
+            bPiecesByProfile[bProfile].push(piece);
+          }
+          for (const [bProfileName, bPieces] of Object.entries(bPiecesByProfile)) {
+            await removePiecesFromProfile(userB, bProfileName, 'have', album, puzzle, bPieces);
+            await removePiecesFromProfile(userB, bProfileName, 'need', album, puzzle, bPieces);
+          }
+          await interaction.update({ content: `✅ Trade confirmed between <@${userA}> and <@${userB}>!\n\n**${dn(album)} → ${dn(puzzle)}**\nPieces traded: ${pieces.join(', ')}`, components: [] });
           await interaction.channel.send(`🎉 <@${userA}> <@${userB}> your trade is complete! Pieces **${pieces.join(', ')}** from **${dn(puzzle)}** have been removed from both your lists.`);
           return;
         }
@@ -1217,6 +1424,17 @@ client.once('clientReady', async () => {
     { name: 'matches', description: 'See your current matches' },
     { name: 'trade', description: 'Trade pieces with another user' },
     {
+      name: 'profile',
+      description: 'Manage your puzzle profiles',
+      options: [
+        { name: 'create', type: 1, description: 'Create a new profile' },
+        { name: 'import', type: 1, description: 'Import an existing profile to this server' },
+        { name: 'list', type: 1, description: 'See all your profiles' },
+        { name: 'switch', type: 1, description: 'Switch active profile for this session' },
+        { name: 'delete', type: 1, description: 'Delete a profile permanently' }
+      ]
+    },
+    {
       name: 'admin',
       description: 'Admin commands (R4 only)',
       options: [
@@ -1228,7 +1446,7 @@ client.once('clientReady', async () => {
   ]);
 
   setInterval(cleanOldData, 60 * 60 * 1000);
-  setInterval(sendReminders, 60 * 60 * 1000); // Check for reminders every hour
+  setInterval(sendReminders, 60 * 60 * 1000);
   console.log(`✅ Logged in as ${client.user.tag}`);
 });
 
