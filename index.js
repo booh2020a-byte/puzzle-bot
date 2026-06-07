@@ -11,7 +11,6 @@ const mongoClient = new MongoClient(process.env.MONGO_URI, {
 });
 let profilesCollection;   // global user profiles
 let serverLinksCollection; // which profiles are linked to which servers
-let logsCollection;
 
 async function connectDB() {
   try {
@@ -20,7 +19,6 @@ async function connectDB() {
     const db = mongoClient.db("puzzleBotDB");
     profilesCollection   = db.collection("profiles");
     serverLinksCollection = db.collection("serverLinks");
-    logsCollection       = db.collection("adminLogs");
   } catch (err) {
     console.error("❌ Erro ao conectar ao MongoDB:", err);
     process.exit(1);
@@ -239,6 +237,74 @@ async function linkProfileToServer(guildId, userId, profileName) {
   );
 }
 
+async function renameProfile(userId, oldName, newName) {
+  const userDoc = await getUserDoc(userId);
+  if (!userDoc?.profiles?.[oldName]) return false;
+  const profileData = userDoc.profiles[oldName];
+  // Copy to new name, delete old
+  await profilesCollection.updateOne(
+    { userId },
+    {
+      $set: { [`profiles.${newName}`]: profileData },
+      $unset: { [`profiles.${oldName}`]: '' }
+    }
+  );
+  // Update all server links
+  const allLinks = await serverLinksCollection.find({ [`members.${userId}.linkedProfiles`]: oldName }).toArray();
+  for (const link of allLinks) {
+    const updated = link.members[userId].linkedProfiles.map(p => p === oldName ? newName : p);
+    const lastUsed = link.members[userId].lastUsedProfile === oldName ? newName : link.members[userId].lastUsedProfile;
+    await serverLinksCollection.updateOne(
+      { guildId: link.guildId },
+      { $set: { [`members.${userId}.linkedProfiles`]: updated, [`members.${userId}.lastUsedProfile`]: lastUsed } }
+    );
+  }
+  return true;
+}
+
+async function getInstantMatches(guildId, userId, profileName) {
+  const myProfile = await getProfile(userId, profileName);
+  if (!myProfile) return null;
+  const allServerProfiles = await getAllServerProfiles(guildId);
+  const matchMap = {};
+
+  for (const direction of ['have', 'need']) {
+    const opposite = direction === 'have' ? 'need' : 'have';
+    for (const { userId: otherId, profileName: otherProfileName, profileData: otherProfile } of allServerProfiles) {
+      if (otherId === userId && otherProfileName === profileName) continue;
+      for (const album in albumsData) {
+        if (!myProfile[direction]?.[album]) continue;
+        for (const puzzle in albumsData[album]) {
+          if (!myProfile[direction][album]?.[puzzle]) continue;
+          const myPieces = myProfile[direction][album][puzzle].map(p => p.piece);
+          const theirPieces = (otherProfile[opposite]?.[album]?.[puzzle] || []).map(p => p.piece);
+          const matches = myPieces.filter(p => theirPieces.includes(p));
+          if (matches.length > 0) {
+            if (!matchMap[album]) matchMap[album] = {};
+            if (!matchMap[album][puzzle]) matchMap[album][puzzle] = [];
+            const verb = direction === 'have' ? 'needs it' : 'has it';
+            matchMap[album][puzzle].push(`${matches.sort((a, b) => Number(a) - Number(b)).join(', ')} — <@${otherId}> [${otherProfileName}] ${verb}`);
+          }
+        }
+      }
+    }
+  }
+
+  if (Object.keys(matchMap).length === 0) return null;
+
+  let body = `🔥 **Your current matches** [${profileName}]:\n\n`;
+  for (const album in albumsData) {
+    if (!matchMap[album]) continue;
+    body += `**${dn(album)}:**\n`;
+    for (const puzzle in albumsData[album]) {
+      if (!matchMap[album]?.[puzzle]) continue;
+      for (const line of matchMap[album][puzzle]) body += `${dn(puzzle)}: ${line}\n`;
+    }
+    body += '\n';
+  }
+  return body.trim();
+}
+
 async function createProfile(userId, profileName) {
   const now = Date.now();
   await profilesCollection.updateOne(
@@ -269,20 +335,8 @@ async function saveProfile(userId, profileName, profileData) {
   );
 }
 
-async function writeLog(guildId, adminId, adminTag, targetId, targetTag, action) {
-  if (!logsCollection) return;
-  await logsCollection.insertOne({ guildId, adminId, adminTag, targetId, targetTag, action, timestamp: new Date() });
-  const cutoff = new Date();
-  cutoff.setDate(cutoff.getDate() - 60);
-  await logsCollection.deleteMany({ timestamp: { $lt: cutoff } });
-}
-
 function makePieces(n) {
   return Array.from({ length: n }, (_, i) => (i + 1).toString());
-}
-
-function isAdmin(member) {
-  return member.roles.cache.some(role => role.name === 'R4');
 }
 
 // ======================
@@ -389,43 +443,6 @@ function cleanExpiredTrades() {
   for (const tradeId in pendingTrades) {
     if (pendingTrades[tradeId].expiresAt < now) delete pendingTrades[tradeId];
   }
-}
-
-function buildExpirePage(entries, page) {
-  const perPage = 10;
-  const slice = entries.slice(page * perPage, (page + 1) * perPage);
-  const totalPages = Math.ceil(entries.length / perPage);
-  let msg = `📋 **User Data Expiry** (Page ${page + 1}/${totalPages}):\n\n`;
-  for (const e of slice) {
-    msg += `<@${e.userId}> [**${e.profileName}**] — **${e.daysLeft}** day(s) until cleanup${e.daysLeft <= 3 ? ' ⚠️' : ''}\n`;
-  }
-  return msg;
-}
-
-function expirePageButtons(page, totalPages, guildId) {
-  const row = new ActionRowBuilder();
-  if (page > 0) row.addComponents(new ButtonBuilder().setCustomId(`expirePage|${guildId}|${page - 1}`).setLabel('◀ Previous').setStyle(ButtonStyle.Secondary));
-  if (page < totalPages - 1) row.addComponents(new ButtonBuilder().setCustomId(`expirePage|${guildId}|${page + 1}`).setLabel('Next ▶').setStyle(ButtonStyle.Secondary));
-  return row.components.length > 0 ? row : null;
-}
-
-function buildLogsPage(logs, page) {
-  const perPage = 10;
-  const slice = logs.slice(page * perPage, (page + 1) * perPage);
-  const totalPages = Math.ceil(logs.length / perPage);
-  let msg = `📋 **Admin Deletion Logs** (Page ${page + 1}/${totalPages}):\n\n`;
-  for (const log of slice) {
-    const date = new Date(log.timestamp).toLocaleString('en-GB', { dateStyle: 'medium', timeStyle: 'short' });
-    msg += `**Admin:** ${log.adminTag}\n**Deleted:** <@${log.targetId}>'s **${log.action}** list\n**When:** ${date}\n\n`;
-  }
-  return msg;
-}
-
-function logsPageButtons(page, totalPages, guildId) {
-  const row = new ActionRowBuilder();
-  if (page > 0) row.addComponents(new ButtonBuilder().setCustomId(`logsPage|${guildId}|${page - 1}`).setLabel('◀ Previous').setStyle(ButtonStyle.Secondary));
-  if (page < totalPages - 1) row.addComponents(new ButtonBuilder().setCustomId(`logsPage|${guildId}|${page + 1}`).setLabel('Next ▶').setStyle(ButtonStyle.Secondary));
-  return row.components.length > 0 ? row : null;
 }
 
 // ======================
@@ -644,24 +661,19 @@ function tradeConfirmButtons(tradeId) {
   );
 }
 
-function adminDeleteUserMenu() {
-  return new ActionRowBuilder().addComponents(
-    new UserSelectMenuBuilder().setCustomId('adminDeleteUser').setPlaceholder('Select user to delete data for')
-  );
-}
-
-function adminDeleteTypeMenu(targetId) {
-  return new ActionRowBuilder().addComponents(
-    new StringSelectMenuBuilder().setCustomId(`adminDeleteType|${targetId}`).setPlaceholder('What to delete?')
-      .addOptions([{ label: 'Have list', value: 'have' }, { label: 'Need list', value: 'need' }, { label: 'Both lists', value: 'both' }])
-  );
-}
-
 // Modal for profile name input
 function profileNameModal(customId, title) {
   const modal = new ModalBuilder().setCustomId(customId).setTitle(title);
   const input = new TextInputBuilder().setCustomId('profileName').setLabel('Profile name (e.g. Main570, Farm600)')
     .setStyle(TextInputStyle.Short).setMinLength(1).setMaxLength(30).setRequired(true);
+  modal.addComponents(new ActionRowBuilder().addComponents(input));
+  return modal;
+}
+
+function profileRenameModal(oldName) {
+  const modal = new ModalBuilder().setCustomId(`profileRenameModal|${oldName}`).setTitle(`Rename profile: ${oldName}`);
+  const input = new TextInputBuilder().setCustomId('profileName').setLabel('New profile name')
+    .setStyle(TextInputStyle.Short).setMinLength(1).setMaxLength(30).setRequired(true).setValue(oldName);
   modal.addComponents(new ActionRowBuilder().addComponents(input));
   return modal;
 }
@@ -765,6 +777,18 @@ client.on('interactionCreate', async interaction => {
         await linkProfileToServer(guildId, userId, profileName);
         session.activeProfile = profileName;
         return interaction.reply({ content: `✅ Profile **${profileName}** created and linked to this server!`, flags: 64 });
+      }
+
+      if (interaction.customId.startsWith('profileRenameModal|')) {
+        const oldName = interaction.customId.split('|')[1];
+        const newName = profileName;
+        if (oldName === newName) return interaction.reply({ content: '❌ The new name is the same as the old name.', flags: 64 });
+        const userDoc = await getUserDoc(userId);
+        if (userDoc?.profiles?.[newName]) return interaction.reply({ content: `❌ A profile named **${newName}** already exists.`, flags: 64 });
+        const success = await renameProfile(userId, oldName, newName);
+        if (!success) return interaction.reply({ content: `❌ Profile **${oldName}** not found.`, flags: 64 });
+        if (session.activeProfile === oldName) session.activeProfile = newName;
+        return interaction.reply({ content: `✅ Profile renamed from **${oldName}** to **${newName}** across all servers!`, flags: 64 });
       }
     }
 
@@ -875,6 +899,27 @@ client.on('interactionCreate', async interaction => {
           return interaction.reply({ content: msg, flags: 64 });
         }
 
+        if (sub === 'unlink') {
+          const linked = await getLinkedProfiles(guildId, userId);
+          if (linked.length === 0) return interaction.reply({ content: '❌ You have no profiles linked to this server.', flags: 64 });
+          return interaction.reply({
+            content: 'Which profile do you want to unlink from this server?',
+            components: [profileSelectMenu(linked, 'unlinkProfile')],
+            flags: 64
+          });
+        }
+
+        if (sub === 'rename') {
+          const userDoc = await getUserDoc(userId);
+          const allProfiles = Object.keys(userDoc?.profiles || {}).filter(k => !k.startsWith('_'));
+          if (allProfiles.length === 0) return interaction.reply({ content: '❌ You have no profiles to rename.', flags: 64 });
+          return interaction.reply({
+            content: 'Which profile do you want to rename?',
+            components: [profileSelectMenu(allProfiles, 'renameProfileSelect')],
+            flags: 64
+          });
+        }
+
         if (sub === 'switch') {
           const linked = await getLinkedProfiles(guildId, userId);
           if (linked.length <= 1) return interaction.reply({ content: '❌ You only have one profile in this server.', flags: 64 });
@@ -894,63 +939,6 @@ client.on('interactionCreate', async interaction => {
             components: [profileSelectMenu(allProfiles, 'deleteProfile')],
             flags: 64
           });
-        }
-      }
-
-      // ======================
-      // ADMIN COMMANDS
-      // ======================
-      if (interaction.commandName === 'admin') {
-        if (!isAdmin(interaction.member)) {
-          return interaction.reply({ content: '❌ You do not have permission to use admin commands.', flags: 64 });
-        }
-
-        const sub = interaction.options.getSubcommand();
-
-        if (sub === 'expire') {
-          const link = await getServerLink(guildId);
-          const now = Date.now();
-          const timeout = 14 * 24 * 60 * 60 * 1000;
-          const entries = [];
-
-          for (const [uid, memberData] of Object.entries(link?.members || {})) {
-            const userDoc = await getUserDoc(uid);
-            for (const profileName of (memberData.linkedProfiles || [])) {
-              const profile = userDoc?.profiles?.[profileName];
-              if (!profile) continue;
-              const lastUpdated = Math.max(profile.haveUpdated || 0, profile.needUpdated || 0);
-              if (lastUpdated === 0) continue;
-              const msLeft = timeout - (now - lastUpdated);
-              const daysLeft = Math.max(0, Math.ceil(msLeft / (24 * 60 * 60 * 1000)));
-              entries.push({ userId: uid, profileName, daysLeft });
-            }
-          }
-
-          if (entries.length === 0) return interaction.reply({ content: '📋 No user data found.', flags: 64 });
-          entries.sort((a, b) => a.daysLeft - b.daysLeft);
-          session.expireEntries = entries;
-          const totalPages = Math.ceil(entries.length / 10);
-          const msg = buildExpirePage(entries, 0);
-          const buttons = expirePageButtons(0, totalPages, guildId);
-          const payload = { content: msg, flags: 64 };
-          if (buttons) payload.components = [buttons];
-          return interaction.reply(payload);
-        }
-
-        if (sub === 'delete') {
-          return interaction.reply({ content: '🗑️ Select the user whose data you want to delete:', components: [adminDeleteUserMenu()], flags: 64 });
-        }
-
-        if (sub === 'logs') {
-          const logs = await logsCollection.find({ guildId }).sort({ timestamp: -1 }).toArray();
-          if (logs.length === 0) return interaction.reply({ content: '📋 No admin deletion logs found.', flags: 64 });
-          const totalPages = Math.ceil(logs.length / 10);
-          const msg = buildLogsPage(logs, 0);
-          const buttons = logsPageButtons(0, totalPages, guildId);
-          session.logsCache = logs;
-          const payload = { content: msg, flags: 64 };
-          if (buttons) payload.components = [buttons];
-          return interaction.reply(payload);
         }
       }
     }
@@ -999,6 +987,26 @@ client.on('interactionCreate', async interaction => {
         return interaction.update({ content: `✅ Now using profile **${profileName}**`, components: [] });
       }
 
+      // UNLINK PROFILE
+      if (interaction.customId === 'unlinkProfile') {
+        const profileName = interaction.values[0];
+        const link = await getServerLink(guildId);
+        const updated = (link?.members?.[userId]?.linkedProfiles || []).filter(p => p !== profileName);
+        await serverLinksCollection.updateOne(
+          { guildId },
+          { $set: { [`members.${userId}.linkedProfiles`]: updated } }
+        );
+        if (session.activeProfile === profileName) delete session.activeProfile;
+        return interaction.update({ content: `✅ Profile **${profileName}** has been unlinked from this server. Your profile data is safe and still available in other servers.`, components: [] });
+      }
+
+      // RENAME PROFILE SELECT
+      if (interaction.customId === 'renameProfileSelect') {
+        const profileName = interaction.values[0];
+        await interaction.showModal(profileRenameModal(profileName));
+        return;
+      }
+
       // SWITCH PROFILE
       if (interaction.customId === 'switchProfile') {
         const profileName = interaction.values[0];
@@ -1012,7 +1020,23 @@ client.on('interactionCreate', async interaction => {
         const profileName = interaction.values[0];
         await linkProfileToServer(guildId, userId, profileName);
         session.activeProfile = profileName;
-        return interaction.update({ content: `✅ Profile **${profileName}** has been linked to this server and is now active!`, components: [] });
+
+        // Show instant matches
+        const matchBody = await getInstantMatches(guildId, userId, profileName);
+        if (matchBody) {
+          const chunks = [];
+          let current = `✅ Profile **${profileName}** has been linked to this server!\n\n`;
+          for (const line of matchBody.split('\n')) {
+            if (current.length + line.length + 1 > 1900) { chunks.push(current); current = ''; }
+            current += line + '\n';
+          }
+          if (current.trim()) chunks.push(current);
+          await interaction.update({ content: chunks[0], components: [] });
+          for (let i = 1; i < chunks.length; i++) await interaction.followUp({ content: chunks[i], flags: 64 });
+        } else {
+          return interaction.update({ content: `✅ Profile **${profileName}** has been linked to this server!\n\nNo matches found yet — use \`/have\` and \`/need\` to register your pieces.`, components: [] });
+        }
+        return;
       }
 
       // DELETE PROFILE
@@ -1030,35 +1054,6 @@ client.on('interactionCreate', async interaction => {
         }
         if (session.activeProfile === profileName) delete session.activeProfile;
         return interaction.update({ content: `✅ Profile **${profileName}** has been permanently deleted.`, components: [] });
-      }
-
-      // ADMIN DELETE USER
-      if (interaction.customId === 'adminDeleteUser') {
-        if (!isAdmin(interaction.member)) return interaction.update({ content: '❌ You do not have permission.', components: [] });
-        const targetId = interaction.values[0];
-        return interaction.update({
-          content: `🗑️ Delete data for <@${targetId}>. What do you want to delete?`,
-          components: [adminDeleteTypeMenu(targetId)]
-        });
-      }
-
-      if (parts[0] === 'adminDeleteType') {
-        if (!isAdmin(interaction.member)) return interaction.update({ content: '❌ You do not have permission.', components: [] });
-        const targetId = parts[1];
-        const action = interaction.values[0];
-        const targetUser = await client.users.fetch(targetId).catch(() => null);
-        const targetTag = targetUser ? targetUser.tag : targetId;
-        const linked = await getLinkedProfiles(guildId, targetId);
-        if (linked.length === 0) return interaction.update({ content: `❌ <@${targetId}> has no data in this server.`, components: [] });
-        for (const profileName of linked) {
-          const profile = await getProfile(targetId, profileName);
-          if (!profile) continue;
-          if (action === 'have' || action === 'both') profile.have = {};
-          if (action === 'need' || action === 'both') profile.need = {};
-          await saveProfile(targetId, profileName, profile);
-        }
-        await writeLog(guildId, userId, interaction.user.tag, targetId, targetTag, action);
-        return interaction.update({ content: `✅ Deleted **${action}** list for <@${targetId}> across all their profiles in this server.\n🪵 This action has been logged.`, components: [] });
       }
 
       // REMOVE ALBUM
@@ -1329,34 +1324,6 @@ client.on('interactionCreate', async interaction => {
         });
       }
 
-      // EXPIRE PAGINATION
-      if (parts[0] === 'expirePage') {
-        if (!isAdmin(interaction.member)) return interaction.reply({ content: '❌ You do not have permission.', flags: 64 });
-        if (interaction.user.id !== interaction.message.interaction?.user?.id) return interaction.reply({ content: '❌ This is not your command.', flags: 64 });
-        const page = parseInt(parts[2]);
-        const entries = session.expireEntries || [];
-        const totalPages = Math.ceil(entries.length / 10);
-        const msg = buildExpirePage(entries, page);
-        const buttons = expirePageButtons(page, totalPages, guildId);
-        const payload = { content: msg };
-        if (buttons) payload.components = [buttons]; else payload.components = [];
-        return interaction.update(payload);
-      }
-
-      // LOGS PAGINATION
-      if (parts[0] === 'logsPage') {
-        if (!isAdmin(interaction.member)) return interaction.reply({ content: '❌ You do not have permission.', flags: 64 });
-        if (interaction.user.id !== interaction.message.interaction?.user?.id) return interaction.reply({ content: '❌ This is not your command.', flags: 64 });
-        const page = parseInt(parts[2]);
-        const logs = session.logsCache || [];
-        const totalPages = Math.ceil(logs.length / 10);
-        const msg = buildLogsPage(logs, page);
-        const buttons = logsPageButtons(page, totalPages, guildId);
-        const payload = { content: msg };
-        if (buttons) payload.components = [buttons]; else payload.components = [];
-        return interaction.update(payload);
-      }
-
       // TRADE BUTTONS
       if (parts[0] === 'tradeConfirm' || parts[0] === 'tradeDecline') {
         const tradeId = parts[1];
@@ -1406,6 +1373,24 @@ client.on('interactionCreate', async interaction => {
 });
 
 // ======================
+// AUTO-UNLINK ON LEAVE
+// ======================
+client.on('guildMemberRemove', async member => {
+  const { guild, id: userId } = member;
+  try {
+    const link = await serverLinksCollection.findOne({ guildId: guild.id });
+    if (!link?.members?.[userId]) return;
+    await serverLinksCollection.updateOne(
+      { guildId: guild.id },
+      { $unset: { [`members.${userId}`]: '' } }
+    );
+    console.log(`🚪 Unlinked profiles for user ${userId} from guild ${guild.id} (left server)`);
+  } catch (err) {
+    console.error('❌ Error on guildMemberRemove:', err);
+  }
+});
+
+// ======================
 // START
 // ======================
 async function start() {
@@ -1431,16 +1416,9 @@ client.once('clientReady', async () => {
         { name: 'import', type: 1, description: 'Import an existing profile to this server' },
         { name: 'list', type: 1, description: 'See all your profiles' },
         { name: 'switch', type: 1, description: 'Switch active profile for this session' },
+        { name: 'rename', type: 1, description: 'Rename a profile' },
+        { name: 'unlink', type: 1, description: 'Unlink a profile from this server' },
         { name: 'delete', type: 1, description: 'Delete a profile permanently' }
-      ]
-    },
-    {
-      name: 'admin',
-      description: 'Admin commands (R4 only)',
-      options: [
-        { name: 'expire', type: 1, description: 'See how long until each user\'s data is deleted' },
-        { name: 'delete', type: 1, description: 'Delete a user\'s have or need list' },
-        { name: 'logs', type: 1, description: 'View admin deletion logs' }
       ]
     }
   ]);
