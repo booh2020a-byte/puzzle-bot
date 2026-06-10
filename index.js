@@ -11,6 +11,7 @@ const mongoClient = new MongoClient(process.env.MONGO_URI, {
 });
 let profilesCollection;   // global user profiles
 let serverLinksCollection; // which profiles are linked to which servers
+let serverSettingsCollection; // channel settings per server
 
 async function connectDB() {
   try {
@@ -19,6 +20,7 @@ async function connectDB() {
     const db = mongoClient.db("puzzleBotDB");
     profilesCollection   = db.collection("profiles");
     serverLinksCollection = db.collection("serverLinks");
+    serverSettingsCollection = db.collection("serverSettings");
   } catch (err) {
     console.error("❌ Erro ao conectar ao MongoDB:", err);
     process.exit(1);
@@ -335,6 +337,58 @@ async function saveProfile(userId, profileName, profileData) {
   );
 }
 
+async function getMatchChannel(guildId) {
+  const settings = await serverSettingsCollection.findOne({ guildId });
+  return settings?.matchChannelId || null;
+}
+
+async function setMatchChannel(guildId, channelId) {
+  await serverSettingsCollection.updateOne(
+    { guildId },
+    { $set: { matchChannelId: channelId } },
+    { upsert: true }
+  );
+}
+
+const WELCOME_MESSAGE = `@everyone
+
+👋 **Puzzle Piece Trading Bot**
+
+Trade puzzle pieces with other players in this server!
+
+─────────────────────────
+**📋 YOUR LISTS**
+\`/have\` — Add pieces you own
+\`/need\` — Add pieces you are looking for
+\`/list\` — See your registered pieces
+\`/remove\` — Remove specific pieces
+\`/clear\` — Clear your Have or Need list
+
+─────────────────────────
+**🔥 TRADING**
+\`/matches\` — See who you can trade with right now
+\`/trade\` — Start a trade with another player
+
+─────────────────────────
+**👤 PROFILES**
+\`/profile create\` — Create a new profile
+\`/profile import\` — Link an existing profile to this server
+\`/profile switch\` — Switch active profile for this session
+\`/profile rename\` — Rename a profile
+\`/profile unlink\` — Unlink a profile from this server
+\`/profile delete\` — Delete a profile permanently
+\`/profile list\` — See all your profiles
+
+─────────────────────────
+**💡 TIPS**
+• First time? The bot will guide you through creating a profile automatically
+• Same profile works across multiple servers — use \`/profile import\` to link it
+• Multiple game accounts? Create separate profiles with \`/profile create\`
+• Data is deleted after **14 days** of inactivity — update regularly!
+
+─────────────────────────
+Questions or suggestions? Contact **booh1** 😊`;
+
 function makePieces(n) {
   return Array.from({ length: n }, (_, i) => (i + 1).toString());
 }
@@ -541,16 +595,31 @@ async function checkMatch(guildId, userId, profileName, type, album, puzzle, cha
   const myProfile = await getProfile(userId, profileName);
   if (!myProfile) return;
   const myPieces = (myProfile[type]?.[album]?.[puzzle] || []).map(p => p.piece);
-  const allProfiles = await getAllServerProfiles(guildId);
 
-  for (const { userId: otherId, profileName: otherProfileName, profileData: otherProfile } of allProfiles) {
-    if (otherId === userId && otherProfileName === profileName) continue;
-    const otherPieces = (otherProfile[opposite]?.[album]?.[puzzle] || []).map(p => p.piece);
-    const matches = myPieces.filter(p => otherPieces.includes(p));
-    if (matches.length > 0 && channel) {
-      await channel.send(
-        `🔥 MATCH!\n<@${userId}> [${profileName}] (${type}) ↔ <@${otherId}> [${otherProfileName}] (${opposite})\nAlbum: ${dn(album)}\nPuzzle: ${dn(puzzle)}\nPieces: ${matches.join(', ')}`
-      );
+  // Get all servers where this profile is linked
+  const allLinks = await serverLinksCollection.find({ [`members.${userId}.linkedProfiles`]: profileName }).toArray();
+  const allGuildIds = [...new Set([guildId, ...allLinks.map(l => l.guildId)])];
+
+  for (const targetGuildId of allGuildIds) {
+    const allServerProfiles = await getAllServerProfiles(targetGuildId);
+
+    for (const { userId: otherId, profileName: otherProfileName, profileData: otherProfile } of allServerProfiles) {
+      if (otherId === userId && otherProfileName === profileName) continue;
+      const otherPieces = (otherProfile[opposite]?.[album]?.[puzzle] || []).map(p => p.piece);
+      const matches = myPieces.filter(p => otherPieces.includes(p));
+      if (matches.length === 0) continue;
+
+      const matchMsg = `🔥 MATCH!\n<@${userId}> [${profileName}] (${type}) ↔ <@${otherId}> [${otherProfileName}] (${opposite})\nAlbum: ${dn(album)}\nPuzzle: ${dn(puzzle)}\nPieces: ${matches.join(', ')}`;
+
+      if (targetGuildId === guildId && channel) {
+        await channel.send(matchMsg);
+      } else {
+        const matchChannelId = await getMatchChannel(targetGuildId);
+        if (matchChannelId) {
+          const matchChannel = await client.channels.fetch(matchChannelId).catch(() => null);
+          if (matchChannel) await matchChannel.send(matchMsg);
+        }
+      }
     }
   }
 }
@@ -847,6 +916,20 @@ client.on('interactionCreate', async interaction => {
           ],
           flags: 64
         });
+      }
+
+      if (interaction.commandName === 'setchannel') {
+        if (!interaction.member.permissions.has('ManageChannels')) {
+          return interaction.reply({ content: '❌ You need the **Manage Channels** permission to use this command.', flags: 64 });
+        }
+        const channel = interaction.channel;
+        await setMatchChannel(guildId, channel.id);
+
+        // Send and pin welcome message
+        await interaction.reply({ content: `✅ This channel has been set as the bot's match channel!`, flags: 64 });
+        const welcomeMsg = await channel.send(WELCOME_MESSAGE);
+        await welcomeMsg.pin().catch(() => {});
+        return;
       }
 
       if (interaction.commandName === 'trade') {
@@ -1373,6 +1456,26 @@ client.on('interactionCreate', async interaction => {
 });
 
 // ======================
+// SETUP MESSAGE ON JOIN
+// ======================
+client.on('guildCreate', async guild => {
+  try {
+    const channel = guild.channels.cache
+      .filter(c => c.type === 0 && c.permissionsFor(guild.members.me).has('SendMessages'))
+      .sort((a, b) => a.position - b.position)
+      .first();
+
+    if (channel) {
+      await channel.send(
+        `👋 **Hey! Thanks for adding the Puzzle Piece Trading Bot!**\n\nTo finish setting up, please run \`/setchannel\` in the channel you want to use for this bot. That will set up the match notifications and send a welcome message for your members.\n\n*Only members with the **Manage Channels** permission can run this command.*`
+      );
+    }
+  } catch (err) {
+    console.error('❌ Error on guildCreate:', err);
+  }
+});
+
+// ======================
 // AUTO-UNLINK ON LEAVE
 // ======================
 client.on('guildMemberRemove', async member => {
@@ -1408,6 +1511,7 @@ client.once('clientReady', async () => {
     { name: 'clear', description: 'Clear your data' },
     { name: 'matches', description: 'See your current matches' },
     { name: 'trade', description: 'Trade pieces with another user' },
+    { name: 'setchannel', description: 'Set this channel as the bot match channel and send welcome message' },
     {
       name: 'profile',
       description: 'Manage your puzzle profiles',
